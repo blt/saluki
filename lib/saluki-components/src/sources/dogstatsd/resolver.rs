@@ -186,6 +186,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn zero_tagset_limit_preserves_tags() {
+        let config = DogStatsDConfiguration {
+            cached_tagsets_limit: 0,
+            context_string_interner_size_bytes: Some(ByteSize::b(1)),
+            ..DogStatsDConfiguration::for_test()
+        };
+        let mut resolvers = ContextResolvers::new(&config, &test_context(), None).unwrap();
+
+        let tags = ["env:prod", "service:more-than-23-bytes-long"];
+        for resolver in [&mut resolvers.primary, &mut resolvers.no_agg] {
+            let context = resolver.resolve("metric", tags, None).unwrap();
+            assert_eq!(context.tags().len(), tags.len());
+            assert!(tags.iter().all(|tag| context.tags().has_tag(tag)));
+        }
+    }
+
+    #[tokio::test]
     async fn exhausted_interner_rejects_contexts_with_uninterned_tags() {
         let config = DogStatsDConfiguration {
             cached_tagsets_limit: 0,
