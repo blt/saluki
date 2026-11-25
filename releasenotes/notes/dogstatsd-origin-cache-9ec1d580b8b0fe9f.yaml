@@ -1,0 +1,3 @@
+enhancements:
+  - |
+    Reuse resolved DogStatsD origin tags between tag-store updates.
