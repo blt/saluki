@@ -1,10 +1,27 @@
-use std::{mem::ManuallyDrop, sync::Arc};
+use std::{
+    mem::{self, ManuallyDrop},
+    sync::Arc,
+};
 
-use bytes::{buf::UninitSlice, Buf, BufMut};
+use bytes::{buf::UninitSlice, Buf, BufMut, BytesMut};
 use saluki_core::pooling::{helpers::pooled_newtype, Clearable, ReclaimStrategy};
 use triomphe::{Arc as TriompheArc, UniqueArc};
 
+use super::slab::{BufferSlabs, Slab};
 use super::{ClearableIoBuffer, CollapsibleReadWriteIoBuffer, ReadCursor, ReadIoBuffer};
+
+struct Storage {
+    bytes: BytesMut,
+    slab: Option<Arc<Slab>>,
+}
+
+impl Drop for Storage {
+    fn drop(&mut self) {
+        if let Some(slab) = &self.slab {
+            slab.release(mem::take(&mut self.bytes));
+        }
+    }
+}
 
 /// A fixed-size bytes buffer.
 ///
@@ -14,7 +31,7 @@ use super::{ClearableIoBuffer, CollapsibleReadWriteIoBuffer, ReadCursor, ReadIoB
 ///
 /// Additionally, it's designed for use in object pools (implements [`Clearable`]).
 pub struct FixedSizeVec {
-    data: UniqueArc<Vec<u8>>,
+    data: UniqueArc<Storage>,
     read_idx: usize,
 }
 
@@ -24,8 +41,31 @@ impl FixedSizeVec {
     /// The vector won't grow once all available capacity has been consumed, and must be cleared to be reused.
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            data: UniqueArc::new(Vec::with_capacity(capacity)),
+            data: UniqueArc::new(Storage {
+                bytes: BytesMut::with_capacity(capacity),
+                slab: None,
+            }),
             read_idx: 0,
+        }
+    }
+
+    /// Creates a builder that packs fixed-size buffers into shared allocations.
+    ///
+    /// Each buffer keeps its slab alive until the buffer drops. The builder keeps no empty slabs alive.
+    pub fn slab_builder(capacity: usize, max_buffers: usize) -> impl Fn() -> Self + Send + Sync {
+        let slabs = BufferSlabs::new(capacity, max_buffers);
+        move || match &slabs {
+            Some(slabs) => {
+                let (bytes, slab) = slabs.take();
+                Self {
+                    data: UniqueArc::new(Storage {
+                        bytes,
+                        slab: Some(slab),
+                    }),
+                    read_idx: 0,
+                }
+            }
+            None => Self::with_capacity(capacity),
         }
     }
 
@@ -39,13 +79,13 @@ impl FixedSizeVec {
 
 impl Clearable for FixedSizeVec {
     fn clear(&mut self) {
-        self.data.clear();
+        self.data.bytes.clear();
         self.read_idx = 0;
     }
 }
 
 struct FrozenFixedSizeVec {
-    data: TriompheArc<Vec<u8>>,
+    data: TriompheArc<Storage>,
     read_idx: usize,
 }
 
@@ -73,8 +113,8 @@ impl BytesBuffer {
     /// Returns a cursor over the unread bytes, which advances this buffer as bytes are taken.
     pub fn cursor(&mut self) -> ReadCursor<'_> {
         let FixedSizeVec { data, read_idx } = self.data_mut();
-        let capacity = data.capacity();
-        ReadCursor::new(&data[..], read_idx, capacity)
+        let capacity = data.bytes.capacity();
+        ReadCursor::new(&data.bytes, read_idx, capacity)
     }
 
     /// Consumes this buffer and returns a read-only version of it.
@@ -90,41 +130,46 @@ impl BytesBuffer {
 
 impl Buf for BytesBuffer {
     fn remaining(&self) -> usize {
-        self.data().data.len() - self.data().read_idx
+        let data = self.data();
+        data.data.bytes.len() - data.read_idx
     }
 
     fn chunk(&self) -> &[u8] {
         let data = self.data();
-        &data.data[data.read_idx..data.data.len()]
+        &data.data.bytes[data.read_idx..]
     }
 
     fn advance(&mut self, cnt: usize) {
         let data = self.data_mut();
-        saluki_antithesis::always_le!(data.read_idx + cnt, data.data.len(), "buffer advance within bounds");
-        assert!(data.read_idx + cnt <= data.data.len());
+        saluki_antithesis::always_le!(
+            data.read_idx + cnt,
+            data.data.bytes.len(),
+            "buffer advance within bounds"
+        );
+        assert!(data.read_idx + cnt <= data.data.bytes.len());
         data.read_idx += cnt;
     }
 }
 
 unsafe impl BufMut for BytesBuffer {
     fn remaining_mut(&self) -> usize {
-        let data = self.data();
-        data.data.capacity() - data.data.len()
+        let bytes = &self.data().data.bytes;
+        bytes.capacity() - bytes.len()
     }
 
     fn chunk_mut(&mut self) -> &mut UninitSlice {
-        self.data_mut().data.spare_capacity_mut().into()
+        self.data_mut().data.bytes.spare_capacity_mut().into()
     }
 
     unsafe fn advance_mut(&mut self, cnt: usize) {
-        let new_len = self.data().data.len() + cnt;
-        self.data_mut().data.set_len(new_len);
+        let bytes = &mut self.data_mut().data.bytes;
+        bytes.set_len(bytes.len() + cnt);
     }
 }
 
 impl ReadIoBuffer for BytesBuffer {
     fn capacity(&self) -> usize {
-        self.data().data.capacity()
+        self.data().data.bytes.capacity()
     }
 }
 
@@ -136,7 +181,7 @@ impl CollapsibleReadWriteIoBuffer for BytesBuffer {
         if remaining == 0 {
             let inner = self.data_mut();
             inner.read_idx = 0;
-            inner.data.clear();
+            inner.data.bytes.clear();
             return;
         }
 
@@ -145,9 +190,9 @@ impl CollapsibleReadWriteIoBuffer for BytesBuffer {
         let inner = self.data_mut();
 
         let src_start = inner.read_idx;
-        let src_end = inner.data.len();
-        inner.data.copy_within(src_start..src_end, 0);
-        inner.data.truncate(remaining);
+        let src_end = inner.data.bytes.len();
+        inner.data.bytes.copy_within(src_start..src_end, 0);
+        inner.data.bytes.truncate(remaining);
         inner.read_idx = 0;
     }
 }
@@ -177,36 +222,36 @@ pub struct FrozenBytesBuffer {
 impl FrozenBytesBuffer {
     /// Returns `true` if the buffer is empty.
     pub fn is_empty(&self) -> bool {
-        self.data.read_idx == self.data.data.len()
+        self.data.read_idx == self.data.data.bytes.len()
     }
 
     /// Returns the number of bytes remaining in the buffer.
     pub fn len(&self) -> usize {
-        self.data.data.len() - self.data.read_idx
+        self.data.data.bytes.len() - self.data.read_idx
     }
 
     /// Returns the total capacity of the buffer.
     pub fn capacity(&self) -> usize {
-        self.data.data.capacity()
+        self.data.data.bytes.capacity()
     }
 }
 
 impl Buf for FrozenBytesBuffer {
     fn remaining(&self) -> usize {
-        self.data.data.len() - self.data.read_idx
+        self.len()
     }
 
     fn chunk(&self) -> &[u8] {
-        &self.data.data[self.data.read_idx..]
+        &self.data.data.bytes[self.data.read_idx..]
     }
 
     fn advance(&mut self, cnt: usize) {
         saluki_antithesis::always_le!(
             self.data.read_idx + cnt,
-            self.data.data.len(),
+            self.data.data.bytes.len(),
             "buffer advance within bounds"
         );
-        assert!(self.data.read_idx + cnt <= self.data.data.len());
+        assert!(self.data.read_idx + cnt <= self.data.data.bytes.len());
         self.data.read_idx += cnt;
     }
 }
@@ -226,9 +271,51 @@ impl Drop for FrozenBytesBuffer {
 
 #[cfg(test)]
 mod tests {
-    use saluki_core::pooling::helpers::get_pooled_object_via_builder;
+    use std::{sync::Barrier, thread};
+
+    use futures::FutureExt as _;
+    use saluki_core::pooling::{helpers::get_pooled_object_via_builder, FixedSizeObjectPool, ObjectPool as _};
 
     use super::*;
+
+    #[tokio::test]
+    async fn slab_slices_survive_concurrent_handoff_and_drop() {
+        const CAPACITY: usize = 8196;
+        let pool = FixedSizeObjectPool::<BytesBuffer>::with_builder(
+            "test_slab_buffers",
+            2,
+            FixedSizeVec::slab_builder(CAPACITY, 2),
+        );
+        let mut first = pool.acquire().await;
+        let mut second = pool.acquire().await;
+        let first_ptr = first.chunk_mut().as_mut_ptr();
+        let second_ptr = second.chunk_mut().as_mut_ptr();
+        assert_eq!(first_ptr.addr().abs_diff(second_ptr.addr()), 8200);
+        assert_eq!(first.remaining_mut(), CAPACITY);
+
+        first.put_bytes(b'a', CAPACITY);
+        let first = first.freeze();
+        let clone = first.clone();
+        assert!(pool.acquire().now_or_never().is_none());
+
+        let barrier = Barrier::new(2);
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                barrier.wait();
+                assert_eq!(first.chunk(), &[b'a'; CAPACITY]);
+                drop(first);
+            });
+            barrier.wait();
+            second.put_bytes(b'b', CAPACITY);
+            assert_eq!(clone.chunk(), &[b'a'; CAPACITY]);
+            drop(clone);
+        });
+
+        let mut returned = pool.acquire().now_or_never().expect("the last clone returns the slot");
+        assert_eq!(returned.chunk_mut().as_mut_ptr(), first_ptr);
+        assert_eq!(returned.remaining(), 0);
+        assert_eq!(second.chunk(), &[b'b'; CAPACITY]);
+    }
 
     #[test]
     fn basic() {
