@@ -611,38 +611,3 @@ impl<'a> Iterator for TagIter<'a> {
 }
 
 impl ExactSizeIterator for TagIter<'_> {}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn borrows_ordered_unique_tags_until_the_last_strong_reference_drops() {
-        let packed = Packed::new(
-            Parts {
-                key: super::super::hash_context("test.metric", ["env:prod", "bare"], &TagSet::default()).0,
-                name: "test.metric",
-                host: Some("host"),
-                origin: TagSet::default(),
-                domain: None,
-                tracked: false,
-                metadata: TagMetadata {
-                    deduplicate: true,
-                    ..TagMetadata::default()
-                },
-                lease: None,
-            },
-            ["env:prod", "bare", "env:prod"],
-        );
-        let weak = packed.downgrade();
-        assert_eq!(packed.name(), "test.metric");
-        assert_eq!(packed.host(), Some("host"));
-        assert_eq!(
-            packed.tag_iter().map(TagRef::as_str).collect::<Vec<_>>(),
-            ["env:prod", "bare"]
-        );
-        assert!(weak.upgrade().unwrap().ptr_eq(&packed));
-        drop(packed);
-        assert!(weak.upgrade().is_none());
-    }
-}

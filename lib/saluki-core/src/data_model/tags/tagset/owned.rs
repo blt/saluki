@@ -334,9 +334,19 @@ impl TagSet {
         self.overlay.is_some()
     }
 
-    #[cfg(test)]
     pub(crate) fn addition_count(&self) -> usize {
         self.overlay.as_ref().map_or(0, |overlay| overlay.additions.len())
+    }
+
+    pub(crate) fn from_context_tags<'a>(
+        tags: impl Iterator<Item = &'a str>, base_count: usize, modified: bool,
+    ) -> Self {
+        let mut tags = tags.map(Tag::from);
+        let mut result = Self::from(SharedTagSet::from_tags(tags.by_ref().take(base_count).collect()));
+        if modified {
+            result.ensure_overlay().additions.extend(tags);
+        }
+        result
     }
 
     fn ensure_overlay(&mut self) -> &mut TagSetOverlay {
