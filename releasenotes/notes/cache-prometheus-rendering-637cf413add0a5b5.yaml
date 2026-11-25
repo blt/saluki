@@ -1,0 +1,3 @@
+enhancements:
+  - |
+    Reuse Prometheus exposition text for repeated scrapes of the same internal metrics snapshot.
