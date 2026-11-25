@@ -16,6 +16,10 @@ mod hash;
 use self::hash::{hash_context, hash_context_with_host_and_seen};
 pub use self::hash::{hash_context_with_host, ContextKey};
 
+#[cfg(test)]
+#[allow(dead_code)]
+mod packed;
+
 mod resolver;
 pub use self::resolver::{ContextResolver, ContextResolverBuilder, TagsResolver, TagsResolverBuilder};
 use crate::data_model::tags::{Tag, TagRef, TagSet, TagSetIter};

@@ -334,6 +334,11 @@ impl TagSet {
         self.overlay.is_some()
     }
 
+    #[cfg(test)]
+    pub(crate) fn addition_count(&self) -> usize {
+        self.overlay.as_ref().map_or(0, |overlay| overlay.additions.len())
+    }
+
     fn ensure_overlay(&mut self) -> &mut TagSetOverlay {
         self.overlay.get_or_insert_with(|| {
             Box::new(TagSetOverlay {
