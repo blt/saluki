@@ -1,6 +1,6 @@
 use std::{hash::BuildHasher, mem, num::NonZeroU64, time::Duration};
 
-use ddsketch::DDSketch;
+use ddsketch::{Bin, DDSketch};
 use hashbrown::HashTable;
 use saluki_core::data_model::event::metric::{
     context::Context, Histogram, HistogramPoints, MetricMetadata, MetricOrigin, MetricValues, ScalarPoints, SetBucket,
@@ -93,6 +93,22 @@ impl<T> Pages<T> {
         &mut self.pages[index / Self::ROWS][index % Self::ROWS]
     }
 
+    fn push_bytes(&self) -> usize {
+        if !self.len.is_multiple_of(Self::ROWS) {
+            return 0;
+        }
+        let page = if self.spare.is_empty() { PAGE_BYTES } else { 0 };
+        let directory = if self.pages.len() == self.pages.capacity() {
+            self.pages
+                .capacity()
+                .max(2)
+                .saturating_mul(2 * mem::size_of::<Vec<T>>())
+        } else {
+            0
+        };
+        page + directory
+    }
+
     fn push(&mut self, value: T) {
         if self.len.is_multiple_of(Self::ROWS) {
             self.pages
@@ -153,6 +169,21 @@ impl<T> Default for SideStore<T> {
 }
 
 impl<T> SideStore<T> {
+    fn insert_bytes(&self) -> usize {
+        if self.free.is_some() {
+            0
+        } else {
+            self.slots.push_bytes()
+        }
+    }
+
+    fn get(&self, index: u32) -> &T {
+        match self.slots.get(index as usize) {
+            SideSlot::Live(value) => value,
+            SideSlot::Free(_) => unreachable!("a retained row owns its side slot"),
+        }
+    }
+
     fn insert(&mut self, value: T) -> u32 {
         self.live += 1;
         if let Some(index) = self.free {
@@ -416,6 +447,29 @@ impl Rows {
         }
     }
 
+    fn push_bytes(&self, kind: Kind) -> usize {
+        match kind {
+            Kind::Gauge => self.gauge.push_bytes(),
+            Kind::Counter => self.count.push_bytes(),
+            Kind::Rate => self.rate.push_bytes(),
+            Kind::Set => self.set.push_bytes(),
+            Kind::Histogram => self.histogram.push_bytes(),
+            Kind::Distribution => self.distribution.push_bytes(),
+        }
+    }
+
+    fn overflow_index(&self, slot: Slot) -> u32 {
+        let i = slot.index();
+        match slot.kind() {
+            Kind::Gauge => self.gauge.get(i).payload.timestamps[0],
+            Kind::Counter => self.count.get(i).payload.scalar.timestamps[0],
+            Kind::Rate => self.rate.get(i).payload.scalar.timestamps[0],
+            Kind::Set => self.set.get(i).payload.timestamp,
+            Kind::Histogram => self.histogram.get(i).payload.timestamp,
+            Kind::Distribution => self.distribution.get(i).payload.timestamp,
+        }
+    }
+
     fn header(&self, slot: Slot) -> &Header {
         let i = slot.index();
         match slot.kind() {
@@ -543,6 +597,163 @@ impl Storage {
             })
             .copied()
             .map(Slot)
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn growth_bytes(
+        &self, slot: Option<Slot>, values: &MetricValues, metadata: &MetricMetadata, last_seen: u64,
+    ) -> usize {
+        let kind = Kind::from(values);
+        let same = slot.filter(|slot| slot.kind() == kind);
+        let mut bytes = if same.is_none() { self.rows.push_bytes(kind) } else { 0 };
+        let header = slot.map(|slot| self.header(slot));
+        if header.is_none() && self.index.len() == self.index.capacity() {
+            bytes = bytes.saturating_add(self.index.len().max(4).saturating_mul(4 * (mem::size_of::<u32>() + 1)));
+        }
+        let new_metadata_slot = match header {
+            None => static_metadata_id(metadata).is_none(),
+            Some(header) => {
+                header.metadata_id & (OWNED_METADATA | 4) == 0
+                    && metadata.unit().is_some_and(|unit| unit != "millisecond")
+            }
+        };
+        if new_metadata_slot {
+            bytes = bytes.saturating_add(self.metadata.0.insert_bytes());
+        }
+
+        let old_flags = header.map_or(0, |row| row.flags);
+        let reuses_overflow = old_flags & FALLBACK != 0;
+        let old_overflow = same
+            .filter(|_| reuses_overflow)
+            .map(|slot| self.overflow.get(self.rows.overflow_index(slot)));
+        let inline = same.filter(|_| old_flags != 0 && !reuses_overflow);
+        let epoch = self
+            .epoch
+            .unwrap_or_else(|| last_seen.saturating_sub(u64::from(u32::MAX) / 2));
+        let (growth, needs_overflow) = self.value_growth(values, old_overflow, inline, old_flags, epoch);
+        bytes = bytes.saturating_add(growth);
+        if needs_overflow && !reuses_overflow {
+            bytes = bytes.saturating_add(self.overflow.insert_bytes());
+        }
+        bytes
+    }
+
+    fn value_growth(
+        &self, values: &MetricValues, old: Option<&MetricValues>, inline: Option<Slot>, flags: u16, epoch: u64,
+    ) -> (usize, bool) {
+        match values {
+            MetricValues::Set(points) => {
+                let previous = old.and_then(|old| {
+                    if let MetricValues::Set(set) = old {
+                        Some(set)
+                    } else {
+                        None
+                    }
+                });
+                let packed = inline.map(|slot| {
+                    let row = &self.rows.set.get(slot.index()).payload;
+                    (decode_timestamp(epoch, row.timestamp), &row.value)
+                });
+                let (growth, buckets) = points.merge_growth_bytes(previous, packed);
+                let out_of_range = points.into_iter().any(|(ts, _)| encode_timestamp(epoch, ts).is_none());
+                (growth, buckets > 1 || out_of_range)
+            }
+            MetricValues::Histogram(points) => {
+                let previous = old.and_then(|old| {
+                    if let MetricValues::Histogram(p) = old {
+                        Some(p)
+                    } else {
+                        None
+                    }
+                });
+                let packed = inline.map(|slot| {
+                    let row = &self.rows.histogram.get(slot.index()).payload;
+                    (decode_timestamp(epoch, row.timestamp), usize::from((flags & 0xff) - 1))
+                });
+                let mut buckets = previous.map_or(usize::from(packed.is_some()), HistogramPoints::len);
+                let old_buckets = buckets;
+                let mut growth = 0usize;
+                let mut overflow = false;
+                for (ts, histogram) in points {
+                    let additional = histogram.samples().len();
+                    let existing = previous.and_then(|previous| previous.into_iter().find(|(old, _)| *old == ts));
+                    let (old, alloc) = if let Some((_, existing)) = existing {
+                        (existing.samples().len(), existing.merge_growth_bytes(additional))
+                    } else if let Some((_, samples)) = packed.filter(|(old, _)| *old == ts) {
+                        (samples, Histogram::inline_merge_growth_bytes(samples, additional))
+                    } else {
+                        buckets += 1;
+                        (0, Histogram::inline_merge_growth_bytes(0, additional))
+                    };
+                    growth = growth.saturating_add(alloc);
+                    overflow |= old.saturating_add(additional) > 3 || encode_timestamp(epoch, ts).is_none();
+                }
+                (
+                    growth.saturating_add(bucket_growth::<Histogram>(old_buckets, buckets)),
+                    overflow || buckets > 1,
+                )
+            }
+            MetricValues::Distribution(points) => {
+                let previous = old.and_then(|old| {
+                    if let MetricValues::Distribution(p) = old {
+                        Some(p)
+                    } else {
+                        None
+                    }
+                });
+                let packed = inline.map(|slot| {
+                    let row = &self.rows.distribution.get(slot.index()).payload;
+                    (decode_timestamp(epoch, row.timestamp), usize::from(flags - 1))
+                });
+                let mut buckets = previous.map_or(usize::from(packed.is_some()), SketchPoints::len);
+                let old_buckets = buckets;
+                let mut growth = 0usize;
+                let mut overflow = false;
+                for (ts, sketch) in points {
+                    let bins = previous
+                        .and_then(|previous| previous.into_iter().find(|(old, _)| *old == ts))
+                        .map(|(_, sketch)| sketch.bin_count())
+                        .or_else(|| packed.filter(|(old, _)| *old == ts).map(|(_, bins)| bins));
+                    buckets += usize::from(bins.is_none());
+                    // DDSketch builds a fresh bin vector before it drops the old one or collapses excess bins.
+                    let required = bins.unwrap_or(0).saturating_add(sketch.bin_count());
+                    if required > 4 {
+                        growth = growth.saturating_add(required.saturating_mul(2 * mem::size_of::<Bin>()));
+                    }
+                    overflow |= required > 4 || encode_timestamp(epoch, ts).is_none();
+                }
+                (
+                    growth.saturating_add(bucket_growth::<DDSketch>(old_buckets, buckets)),
+                    overflow || buckets > 1,
+                )
+            }
+            MetricValues::Gauge(points) | MetricValues::Counter(points) | MetricValues::Rate(points, _) => {
+                let existing = inline.map(|slot| match slot.kind() {
+                    Kind::Gauge => &self.rows.gauge.get(slot.index()).payload,
+                    Kind::Counter => &self.rows.count.get(slot.index()).payload.scalar,
+                    Kind::Rate => &self.rows.rate.get(slot.index()).payload.scalar,
+                    _ => unreachable!(),
+                });
+                let mut old_len = old.map_or(0, MetricValues::len);
+                let mut overflow = false;
+                if let Some(existing) = existing {
+                    old_len = usize::from(flags);
+                    if let Some((ts, _)) = points.single_point() {
+                        if let Some(ts) = encode_timestamp(epoch, ts) {
+                            return (0, old_len == 2 && !existing.timestamps.contains(&ts));
+                        }
+                    }
+                }
+                let new_len = old_len.saturating_add(points.len());
+                overflow |= new_len > 2 || points.into_iter().any(|(ts, _)| encode_timestamp(epoch, ts).is_none());
+                let bytes = if new_len > 4 {
+                    bucket_growth::<f64>(old_len.max(4), new_len)
+                } else {
+                    0
+                };
+                (bytes, overflow)
+            }
+        }
     }
 
     pub(super) fn insert(
@@ -827,6 +1038,14 @@ impl Storage {
     pub(super) fn trim_empty_side_stores(&mut self) {
         self.metadata.0.trim_if_empty();
         self.overflow.trim_if_empty();
+    }
+}
+
+fn bucket_growth<T>(old: usize, required: usize) -> usize {
+    if required > old.max(1) {
+        required.saturating_mul(2 * (mem::size_of::<T>() + mem::size_of::<u64>()))
+    } else {
+        0
     }
 }
 
