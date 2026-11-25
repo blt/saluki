@@ -5,6 +5,8 @@ use saluki_common::{
     hash::{get_fast_hasher, hash_single_fast},
 };
 
+const MEDIUM_TAG_CAPACITY: usize = 64;
+
 /// Hashes a metric context.
 ///
 /// Takes a metric name, an iterator of tags, and an iterator of origin tags, and returns a tuple containing a unique
@@ -26,7 +28,8 @@ where
     T2: AsRef<str>,
 {
     let mut seen = PrehashedHashSet::default();
-    hash_context_with_host_and_seen(name, None, tags, origin_tags, &mut seen)
+    let (context, tagset, _) = hash_context_with_host_and_seen(name, None, tags, origin_tags, &mut seen);
+    (context, tagset)
 }
 
 /// Hashes a metric context with an explicit host dimension, using a provided set to track duplicate tags.
@@ -54,12 +57,14 @@ where
     T2: AsRef<str>,
 {
     let mut seen = PrehashedHashSet::default();
-    hash_context_with_host_and_seen(name, host, tags, origin_tags, &mut seen)
+    let (context, tagset, _) = hash_context_with_host_and_seen(name, host, tags, origin_tags, &mut seen);
+    (context, tagset)
 }
 
+// A repeated hash can be a duplicate tag or a collision. Distinct hashes rule out duplicate tags.
 pub(super) fn hash_context_with_host_and_seen<I, I2, T, T2>(
     name: &str, host: Option<&str>, tags: I, origin_tags: I2, seen: &mut PrehashedHashSet<u64>,
-) -> (ContextKey, TagSetKey)
+) -> (ContextKey, TagSetKey, bool)
 where
     I: IntoIterator<Item = T>,
     T: AsRef<str>,
@@ -71,63 +76,107 @@ where
     name.hash(&mut hasher);
     host.hash(&mut hasher);
 
-    let combined_tags_hash = hash_tags(tags, seen);
+    let (combined_tags_hash, tags_may_repeat) = hash_tags(tags, seen);
     hasher.write_u64(combined_tags_hash);
 
-    hasher.write_u64(hash_tags(origin_tags, seen));
+    hasher.write_u64(hash_tags(origin_tags, seen).0);
 
     let context_key = ContextKey { hash: hasher.finish() };
     let tagset_key = TagSetKey {
         hash: combined_tags_hash,
     };
 
-    (context_key, tagset_key)
+    (context_key, tagset_key, tags_may_repeat)
 }
 
 /// XORs the distinct tag hashes. Tags and origin tags use independent deduplication scopes.
 #[inline]
-fn hash_tags<I, T>(tags: I, seen: &mut PrehashedHashSet<u64>) -> u64
+fn hash_tags<I, T>(tags: I, seen: &mut PrehashedHashSet<u64>) -> (u64, bool)
 where
     I: IntoIterator<Item = T>,
     T: AsRef<str>,
 {
-    const STACK_CAPACITY: usize = 16;
+    const INLINE_CAPACITY: usize = 16;
 
     let mut hashes = tags.into_iter().map(|tag| hash_single_fast(tag.as_ref()));
     let mut combined = 0;
+    let mut may_repeat = false;
 
-    if hashes.size_hint().0 <= STACK_CAPACITY {
-        let mut inline = [0; STACK_CAPACITY];
+    let lower_bound = hashes.size_hint().0;
+    if lower_bound <= INLINE_CAPACITY {
+        let mut inline = [0; INLINE_CAPACITY];
         let mut len = 0;
-        loop {
-            let Some(hash) = hashes.next() else {
-                return combined;
-            };
+        for hash in hashes.by_ref() {
             if inline[..len].contains(&hash) {
+                may_repeat = true;
                 continue;
             }
-            combined ^= hash;
-            if len == STACK_CAPACITY {
-                // Transfer the hashes already seen without rehashing their strings.
-                seen.clear();
-                seen.extend(inline);
-                seen.insert(hash);
-                break;
+            if len == INLINE_CAPACITY {
+                let (combined, repeats) =
+                    hash_medium_tags(inline.into_iter().chain(std::iter::once(hash)).chain(hashes), seen);
+                return (combined, may_repeat || repeats);
             }
+            combined ^= hash;
             inline[len] = hash;
             len += 1;
         }
-    } else {
-        seen.clear();
+        return (combined, may_repeat);
+    }
+    if lower_bound <= MEDIUM_TAG_CAPACITY {
+        return hash_medium_tags(hashes, seen);
     }
 
+    seen.clear();
     for hash in hashes {
         if seen.insert(hash) {
             combined ^= hash;
+        } else {
+            may_repeat = true;
         }
     }
 
-    combined
+    (combined, may_repeat)
+}
+
+// Keep the stack table at most half full. XOR ignores zero, so zero can also mark empty slots.
+fn hash_medium_tags(mut hashes: impl Iterator<Item = u64>, seen: &mut PrehashedHashSet<u64>) -> (u64, bool) {
+    const BUCKETS: usize = MEDIUM_TAG_CAPACITY * 2;
+    let mut slots = [0; BUCKETS];
+    let mut combined = 0;
+    let mut len = 0;
+    let mut may_repeat = false;
+    for hash in hashes.by_ref() {
+        let mut index = hash as usize & (BUCKETS - 1);
+        loop {
+            let slot = &mut slots[index];
+            if *slot == hash {
+                may_repeat = true;
+                break;
+            }
+            if *slot == 0 {
+                *slot = hash;
+                combined ^= hash;
+                len += 1;
+                break;
+            }
+            index = (index + 1) & (BUCKETS - 1);
+        }
+        if len == MEDIUM_TAG_CAPACITY {
+            if let Some(next) = hashes.next() {
+                seen.clear();
+                seen.extend(slots.into_iter().filter(|&slot| slot != 0));
+                for hash in std::iter::once(next).chain(hashes) {
+                    if seen.insert(hash) {
+                        combined ^= hash;
+                    } else {
+                        may_repeat = true;
+                    }
+                }
+            }
+            break;
+        }
+    }
+    (combined, may_repeat)
 }
 
 /// A compact hash key that identifies a metric context.
@@ -159,7 +208,7 @@ mod tests {
 
         let name = "sample.metric";
         let mut seen = PrehashedHashSet::default();
-        for (regular_count, origin_count) in [(0, 0), (16, 17), (17, 16), (17, 18), (2, 1)] {
+        for (regular_count, origin_count) in [(0, 0), (16, 17), (17, 16), (50, 63), (64, 65), (2, 1)] {
             let build_tags = |count| {
                 let mut tags: Vec<_> = (0..count).map(|i| format!("tag:{i}")).collect();
                 if let Some(first) = tags.first() {
@@ -179,10 +228,11 @@ mod tests {
                 hasher.write_u64(tags_hash);
                 hasher.write_u64(baseline_tags(&origin_tags));
 
-                let (context_key, tagset_key) =
+                let (context_key, tagset_key, may_repeat) =
                     hash_context_with_host_and_seen(name, host, &tags, &origin_tags, &mut seen);
                 assert_eq!(context_key.hash, hasher.finish());
                 assert_eq!(tagset_key.hash, tags_hash);
+                assert_eq!(may_repeat, regular_count != 0);
 
                 // Filters hide the length, forcing large inputs to spill from the stack while hashing.
                 let streaming = hash_context_with_host_and_seen(
@@ -192,7 +242,7 @@ mod tests {
                     origin_tags.iter().filter(|_| true),
                     &mut seen,
                 );
-                assert_eq!(streaming, (context_key, tagset_key));
+                assert_eq!(streaming, (context_key, tagset_key, may_repeat));
             }
         }
     }

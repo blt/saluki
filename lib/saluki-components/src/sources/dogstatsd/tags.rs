@@ -6,9 +6,9 @@ use smallvec::SmallVec;
 
 /// Regular (non-well-known) tags from a DogStatsD payload.
 ///
-/// As an optimization, up to 32 tags are stored inline without allocating. This isn't a limit on the number of tags:
+/// As an optimization, up to 64 tags are stored inline without allocating. This isn't a limit on the number of tags:
 /// any beyond that are stored on the heap.
-pub type RegularTags<'a> = SmallVec<[&'a str; 32]>;
+pub type RegularTags<'a> = SmallVec<[&'a str; 64]>;
 
 /// Well-known tags shared across DogStatsD payloads.
 ///
