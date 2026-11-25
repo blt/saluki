@@ -193,6 +193,13 @@ impl Context {
         ContextName::from_str(self.inner.name())
     }
 
+    /// Returns the name and its optional `(table, id)` symbol cache hint.
+    ///
+    /// The hint can be reused for a different string after all owners drop it.
+    pub fn name_with_symbol_id(&self) -> (&str, Option<(usize, u32)>) {
+        self.inner.name_with_symbol_id()
+    }
+
     /// Returns the host of this context, if one has been set.
     pub fn host(&self) -> Option<&str> {
         self.inner.host()
@@ -402,6 +409,11 @@ impl<'a> ContextTags<'a> {
     /// Returns the underlying tag strings in order.
     pub fn strings(self) -> impl ExactSizeIterator<Item = &'a str> + Clone {
         self.into_iter().map(TagRef::as_str)
+    }
+
+    /// Returns tags in order, with optional `(table, id)` symbol cache hints.
+    pub fn strings_with_symbol_ids(self) -> impl ExactSizeIterator<Item = (&'a str, Option<(usize, u32)>)> + Clone {
+        self.0.tag_iter().strings_with_symbol_ids()
     }
 }
 
@@ -617,6 +629,14 @@ mod tests {
             let context = resolver.resolve(name, tags, None).unwrap();
             assert_eq!(context.inner.allocation_bytes(), bytes, "{tags:?}");
             assert_eq!(context.tags().strings().collect::<Vec<_>>(), tags);
+            let (actual_name, name_hint) = context.name_with_symbol_id();
+            assert_eq!(actual_name, name);
+            assert_eq!(name_hint.unwrap().1, _name_symbol.id());
+            let tags_with_hints = context.tags().strings_with_symbol_ids();
+            assert_eq!(tags_with_hints.len(), tags.len());
+            assert!(tags_with_hints
+                .zip(tags)
+                .all(|((text, hint), tag)| { text == tag && hint.is_some() == tag.starts_with("shared_") }));
         }
     }
 
