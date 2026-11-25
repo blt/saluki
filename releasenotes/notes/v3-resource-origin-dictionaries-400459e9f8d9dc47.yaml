@@ -1,0 +1,3 @@
+enhancements:
+  - |
+    Reduce metric encoding CPU use when V3 payloads repeat resource or origin metadata.
