@@ -3,6 +3,8 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use bytes::Bytes;
+use http::header;
 use saluki_api::{
     extract::State,
     response::IntoResponse,
@@ -13,14 +15,38 @@ use saluki_common::sync::shutdown::ShutdownHandle;
 use saluki_error::generic_error;
 use tokio::sync::Mutex;
 
-use super::{get_shared_metrics_state, AggregatedMetricsProcessor, Reflector, TelemetryProcessor};
+use super::{
+    get_shared_metrics_state, AggregatedMetricsProcessor, AggregatedMetricsState, Reflector, TelemetryProcessor,
+};
 use crate::runtime::{state::DataspaceRegistry, InitializationError, Supervisable, SupervisorFuture};
 
 /// State shared by the telemetry API route.
 #[derive(Clone)]
 pub struct InternalTelemetryState {
     metrics: Reflector<AggregatedMetricsProcessor>,
-    processor: Arc<Mutex<TelemetryProcessor>>,
+    exposition: Arc<Mutex<Exposition>>,
+}
+
+#[derive(Default)]
+struct Exposition {
+    processor: TelemetryProcessor,
+    response: Option<(u64, Bytes)>,
+}
+
+impl Exposition {
+    fn render(&mut self, metrics: &AggregatedMetricsState) -> Bytes {
+        // Keep the snapshot stable until the cached response has been checked or rebuilt.
+        let generation = metrics.lock_generation();
+        if let Some((cached_generation, response)) = &self.response {
+            if cached_generation == &*generation {
+                return response.clone();
+            }
+        }
+
+        let response = Bytes::from(self.processor.process(metrics));
+        self.response = Some((*generation, response.clone()));
+        response
+    }
 }
 
 /// API handler that exposes `/metrics` on the unprivileged endpoint.
@@ -33,14 +59,14 @@ impl InternalTelemetryAPIHandler {
         Self {
             state: InternalTelemetryState {
                 metrics,
-                processor: Arc::new(Mutex::new(TelemetryProcessor::new())),
+                exposition: Arc::new(Mutex::new(Exposition::default())),
             },
         }
     }
 
     async fn metrics_handler(State(state): State<InternalTelemetryState>) -> impl IntoResponse {
-        let mut processor = state.processor.lock().await;
-        processor.process(state.metrics.state())
+        let response = state.exposition.lock().await.render(state.metrics.state());
+        ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], response)
     }
 }
 
@@ -88,11 +114,16 @@ mod tests {
     use futures::stream;
     use http::{Request, StatusCode};
     use http_body_util::Empty;
-    use hyper::body::Bytes;
     use tower::ServiceExt as _;
 
     use super::*;
-    use crate::observability::metrics::MetricsSnapshot;
+    use crate::{
+        data_model::event::{
+            metric::{context::Context, Metric},
+            Event,
+        },
+        observability::metrics::{aggregate_upserts, MetricsSnapshot, Processor},
+    };
 
     fn handler() -> InternalTelemetryAPIHandler {
         let (metrics, _worker) = Reflector::new(stream::empty::<Vec<MetricsSnapshot>>(), AggregatedMetricsProcessor);
@@ -115,5 +146,31 @@ mod tests {
         let handler = handler();
         assert_eq!(status(&handler, "/metrics").await, StatusCode::OK);
         assert_eq!(status(&handler, "/compat/metrics").await, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn reuses_exposition_until_a_snapshot_changes_the_gauge() {
+        let context = Context::from_static_parts("adp.aggregate_active_contexts", &["component_id:dsd_agg"]);
+        let gauge = |value| Event::Metric(Metric::gauge(context.clone(), value));
+        let metrics = aggregate_upserts(vec![gauge(1.0)]);
+        let mut exposition = Exposition::default();
+
+        let first = exposition.render(&metrics);
+        assert_eq!(first.as_ptr(), exposition.render(&metrics).as_ptr());
+        assert!(str::from_utf8(&first)
+            .unwrap()
+            .contains("adp__aggregate_active_contexts{component_id=\"dsd_agg\"} 1\n"));
+
+        AggregatedMetricsProcessor.process(
+            MetricsSnapshot {
+                upserts: vec![gauge(2.0)],
+                ..MetricsSnapshot::default()
+            },
+            &metrics,
+        );
+        let next = exposition.render(&metrics);
+        assert!(str::from_utf8(&next)
+            .unwrap()
+            .contains("adp__aggregate_active_contexts{component_id=\"dsd_agg\"} 2\n"));
     }
 }

@@ -7,7 +7,7 @@
 use std::{
     iter::Once,
     pin::Pin,
-    sync::{Arc, OnceLock},
+    sync::{Arc, OnceLock, RwLock, RwLockReadGuard},
 };
 
 use futures::{stream::StreamExt as _, Stream};
@@ -133,6 +133,7 @@ impl AggregatedMetric {
 
 struct Inner {
     metrics: HashMap<Context, AggregatedMetric>,
+    generation: RwLock<u64>,
 }
 
 /// Aggregated metrics state.
@@ -141,6 +142,10 @@ pub struct AggregatedMetricsState {
 }
 
 impl AggregatedMetricsState {
+    pub(super) fn lock_generation(&self) -> RwLockReadGuard<'_, u64> {
+        self.inner.generation.read().unwrap()
+    }
+
     /// Visits all metrics.
     pub fn visit_metrics<F>(&self, mut visitor: F)
     where
@@ -244,11 +249,13 @@ impl Processor for AggregatedMetricsProcessor {
         AggregatedMetricsState {
             inner: Arc::new(Inner {
                 metrics: HashMap::new(),
+                generation: RwLock::new(0),
             }),
         }
     }
 
     fn process(&self, input: Self::Input, state: &Self::State) {
+        let mut generation = state.inner.generation.write().unwrap();
         let metrics = state.inner.metrics.pin();
 
         // Record (or merge) the metric values produced this flush.
@@ -270,6 +277,7 @@ impl Processor for AggregatedMetricsProcessor {
         for context in input.evictions {
             metrics.remove(&context);
         }
+        *generation = generation.wrapping_add(1);
     }
 }
 
