@@ -201,4 +201,20 @@ mod tests {
             assert!(tags.iter().all(|tag| context.tags().has_tag(tag)));
         }
     }
+
+    #[tokio::test]
+    async fn exhausted_interner_rejects_contexts_with_uninterned_tags() {
+        let config = DogStatsDConfiguration {
+            cached_tagsets_limit: 0,
+            allow_context_heap_allocations: false,
+            context_string_interner_size_bytes: Some(ByteSize::b(1)),
+            ..DogStatsDConfiguration::for_test()
+        };
+        let mut resolvers = ContextResolvers::new(&config, &test_context(), None).unwrap();
+
+        let tags = ["env:prod", "service:more-than-23-bytes-long"];
+        for resolver in [&mut resolvers.primary, &mut resolvers.no_agg] {
+            assert!(resolver.resolve("metric", tags, None).is_none());
+        }
+    }
 }

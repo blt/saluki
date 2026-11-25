@@ -1,0 +1,3 @@
+fixes:
+  - |
+    Drop DogStatsD metrics whose tags cannot be resolved when heap fallback is disabled. This prevents metrics from losing tags and merging into a different series.
