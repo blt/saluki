@@ -20,7 +20,7 @@ use saluki_core::{
     topology::{interconnect::BufferedDispatcher, EventsBuffer, OutputDefinition},
 };
 use saluki_error::{generic_error, GenericError};
-use saluki_metrics::MetricsBuilder;
+use saluki_metrics::{Histogram, MetricsBuilder};
 use smallvec::SmallVec;
 use stringtheory::MetaString;
 use tokio::{
@@ -385,9 +385,12 @@ impl TransformBuilder for AggregateConfiguration {
             telemetry.clone(),
         );
 
+        let flush_duration = metrics_builder.register_histogram("aggregate_flush_duration_seconds");
+
         Ok(Box::new(Aggregate {
             state,
             telemetry,
+            flush_duration,
             primary_flush_interval: self.primary_flush_interval,
             flush_open_windows: self.flush_open_windows,
             context_snapshot_requests: Some(context_snapshot_requests),
@@ -451,6 +454,7 @@ impl MemoryBounds for AggregateConfiguration {
 pub struct Aggregate {
     state: AggregationState,
     telemetry: Telemetry,
+    flush_duration: Histogram,
     primary_flush_interval: Duration,
     flush_open_windows: bool,
     context_snapshot_requests: Option<AggregateContextSnapshotRequestReceiver>,
@@ -473,12 +477,12 @@ impl Transform for Aggregate {
         loop {
             select! {
                 _ = health.live() => continue,
-                _ = primary_flush.tick() => {
+                tick = primary_flush.tick() => {
                     // We've reached the end of the current window. Flush our aggregation state and forward the metrics
                     // onwards. Regardless of whether any metrics were aggregated, we always update the aggregation
                     // state to track the start time of the current aggregation window.
                     if !self.state.is_empty() {
-                        debug!("Flushing aggregated metrics...");
+                        debug!(?tick, final_primary_flush, "Flushing aggregated metrics...");
 
                         let should_flush_open_windows = final_primary_flush && self.flush_open_windows;
 
@@ -505,7 +509,10 @@ impl Transform for Aggregate {
                                 Err(e) => error!(error = %e, "Failed to flush aggregated events."),
                             }
 
-                            self.telemetry.record_last_flush_duration(flush_start.elapsed());
+                            let elapsed = flush_start.elapsed();
+                            self.flush_duration.record(elapsed);
+                            self.telemetry.record_last_flush_duration(elapsed);
+                            debug!(?tick, final_primary_flush, duration_ns = elapsed.as_nanos(), "Finished aggregate flush.");
                         };
                         tokio::pin!(flush);
 
@@ -1192,6 +1199,40 @@ mod tests {
         for (values, expected) in cases {
             assert_eq!(AggregateMetricType::from(&values), expected);
         }
+    }
+
+    #[tokio::test]
+    async fn aggregate_flush_records_one_duration_sample() {
+        let recorder = TestRecorder::default();
+        let _local = metrics::set_default_local_recorder(&recorder);
+        let config = AggregateConfiguration {
+            flush_open_windows: true,
+            ..AggregateConfiguration::for_test()
+        };
+        let (control, _outputs) = TestComponentDriver::options()
+            .with_component_id("aggregate")
+            .transform(config)
+            .await
+            .expect("aggregate transform should build");
+
+        control
+            .send_event(Event::Metric(Metric::counter("timed_flush", 1.0)))
+            .await;
+        control
+            .shutdown()
+            .await
+            .expect("aggregate should finish the final flush");
+
+        let labels = &[("component_id", "aggregate"), ("component_type", "transform")];
+        assert_eq!(recorder.counter(("aggregate_flushes_total", labels)), Some(1));
+        let samples = recorder
+            .histogram(("aggregate_flush_duration_seconds", labels))
+            .unwrap();
+        let elapsed_ns = recorder
+            .gauge(("aggregate_last_flush_duration_nanoseconds", labels))
+            .unwrap();
+        assert_eq!(samples.len(), 1);
+        assert!((samples[0] * 1e9 - elapsed_ns).abs() < 1.0);
     }
 
     #[tokio::test]
