@@ -69,6 +69,15 @@ pub trait WorkloadProvider {
     /// entity wasn't found.
     fn get_tags_for_entity(&self, entity_id: &EntityId, cardinality: OriginTagCardinality) -> Option<SharedTagSet>;
 
+    /// Gets the current generation of entity tags and aliases, if the provider supports caching.
+    ///
+    /// The default implementation returns `None`. An opt-in provider returns `None` during updates.
+    /// After an update to tags or aliases, the provider returns a new generation.
+    /// The generation does not cover on-demand PID resolution.
+    fn tag_generation(&self) -> Option<u64> {
+        None
+    }
+
     /// Gets low-cardinality tags for the container that runs this process.
     ///
     /// Providers that cannot determine the process container return `None`.
@@ -92,6 +101,10 @@ where
             Some(provider) => provider.get_tags_for_entity(entity_id, cardinality),
             None => None,
         }
+    }
+
+    fn tag_generation(&self) -> Option<u64> {
+        self.as_ref()?.tag_generation()
     }
 
     fn get_self_container_tags(&self) -> Option<SharedTagSet> {
