@@ -1,5 +1,12 @@
-use std::sync::Arc;
+use std::{
+    cell::RefCell,
+    sync::{
+        atomic::{fence, Ordering},
+        Arc,
+    },
+};
 
+use saluki_common::hash::hash_single_fast;
 use saluki_core::data_model::{
     origin::{OriginTagCardinality, OriginTagsResolver, RawOrigin},
     tags::SharedTagSet,
@@ -13,6 +20,21 @@ use tracing::trace;
 use super::{replay::CapturedTaggerHandle, tags::WellKnownTags};
 
 const REPLAY_PROCESS_ID_MARKER: u32 = 1u32 << 31;
+const ORIGIN_TAG_CACHE_SLOTS: usize = 128;
+
+thread_local! {
+    static ORIGIN_TAG_CACHE: RefCell<[Option<OriginTagCacheEntry>; ORIGIN_TAG_CACHE_SLOTS]> =
+        const { RefCell::new([const { None }; ORIGIN_TAG_CACHE_SLOTS]) };
+}
+
+struct OriginTagCacheEntry {
+    owner: Arc<()>,
+    generation: u64,
+    origin: ResolvedOrigin,
+    process_entity_id: Option<EntityId>,
+    cardinality: OriginTagCardinality,
+    tags: SharedTagSet,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum ProcessOrigin {
@@ -110,6 +132,8 @@ pub(super) struct DogStatsDOriginTagResolver {
     config: OriginEnrichmentConfiguration,
     workload_provider: Arc<dyn WorkloadProvider + Send + Sync>,
     captured_tagger: CapturedTaggerHandle,
+    // Cache entries retain this identity, so a later resolver cannot reuse it while an entry still exists.
+    cache_owner: Arc<()>,
 }
 
 impl DogStatsDOriginTagResolver {
@@ -121,18 +145,68 @@ impl DogStatsDOriginTagResolver {
             config,
             workload_provider,
             captured_tagger,
+            cache_owner: Arc::new(()),
         }
     }
 
     fn collect_origin_tags_with_process_entity(
         &self, origin: &ResolvedOrigin, process_entity_id: Option<&EntityId>,
     ) -> SharedTagSet {
-        let mut collected_tags = SharedTagSet::default();
-
         if !self.config.enabled {
-            return collected_tags;
+            return SharedTagSet::default();
         }
 
+        let cardinality = origin.cardinality().unwrap_or(self.config.tag_cardinality);
+        // The provider can look up an unpinned PID outside the tag store. That mapping has no tag generation.
+        if matches!(process_entity_id, Some(EntityId::ContainerPid(_))) {
+            return self.lookup_origin_tags(origin, process_entity_id, cardinality);
+        }
+        let Some(generation) = self.workload_provider.tag_generation() else {
+            return self.lookup_origin_tags(origin, process_entity_id, cardinality);
+        };
+
+        let slot = hash_single_fast((Arc::as_ptr(&self.cache_owner), origin, process_entity_id, cardinality)) as usize
+            % ORIGIN_TAG_CACHE_SLOTS;
+        let cached_tags = ORIGIN_TAG_CACHE.with_borrow(|cache| {
+            cache[slot]
+                .as_ref()
+                .filter(|entry| {
+                    Arc::ptr_eq(&entry.owner, &self.cache_owner)
+                        && entry.generation == generation
+                        && entry.origin == *origin
+                        && entry.process_entity_id.as_ref() == process_entity_id
+                        && entry.cardinality == cardinality
+                })
+                .map(|entry| entry.tags.clone())
+        });
+        if let Some(tags) = cached_tags {
+            if self.workload_provider.tag_generation() == Some(generation) {
+                return tags;
+            }
+            return self.lookup_origin_tags(origin, process_entity_id, cardinality);
+        }
+
+        let tags = self.lookup_origin_tags(origin, process_entity_id, cardinality);
+        // Keep the tag reads before the final generation check.
+        fence(Ordering::Acquire);
+        if self.workload_provider.tag_generation() == Some(generation) {
+            ORIGIN_TAG_CACHE.with_borrow_mut(|cache| {
+                cache[slot] = Some(OriginTagCacheEntry {
+                    owner: Arc::clone(&self.cache_owner),
+                    generation,
+                    origin: origin.clone(),
+                    process_entity_id: process_entity_id.cloned(),
+                    cardinality,
+                    tags: tags.clone(),
+                });
+            });
+        }
+        tags
+    }
+
+    fn lookup_origin_tags(
+        &self, origin: &ResolvedOrigin, process_entity_id: Option<&EntityId>, tag_cardinality: OriginTagCardinality,
+    ) -> SharedTagSet {
         // Examine the various possible entity ID values, and based on their state, use one or more of them to grab any
         // enriched tags attached to the entities. We evalulate a number of possible entity IDs:
         //
@@ -147,12 +221,11 @@ impl DogStatsDOriginTagResolver {
         let maybe_external_container_id = origin.resolved_external_data().map(|red| red.container_entity_id());
         let maybe_external_pod_uid = origin.resolved_external_data().map(|red| red.pod_entity_id());
 
-        let tag_cardinality = origin.cardinality().unwrap_or(self.config.tag_cardinality);
-
+        let mut collected_tags: Option<SharedTagSet> = None;
         if !self.config.origin_detection_unified {
             if self.config.origin_detection_optout && tag_cardinality == OriginTagCardinality::None {
                 trace!("Skipping origin enrichment for DogStatsD metric with cardinality 'none'.");
-                return collected_tags;
+                return SharedTagSet::default();
             }
 
             // If we discovered an entity ID from socket credentials, and no client-provided entity ID was provided (or
@@ -160,7 +233,7 @@ impl DogStatsDOriginTagResolver {
             if let Some(entity_id) = maybe_process_entity_id {
                 if maybe_local_pod_uid.is_none() || !self.config.entity_id_precedence {
                     if let Some(tags) = self.workload_provider.get_tags_for_entity(entity_id, tag_cardinality) {
-                        collected_tags.extend_from_shared(&tags);
+                        collected_tags = Some(tags);
                     } else {
                         trace!(
                             ?entity_id,
@@ -176,7 +249,10 @@ impl DogStatsDOriginTagResolver {
             let maybe_entity_id = maybe_local_pod_uid.or(maybe_local_container_id);
             if let Some(entity_id) = maybe_entity_id {
                 if let Some(tags) = self.workload_provider.get_tags_for_entity(entity_id, tag_cardinality) {
-                    collected_tags.extend_from_shared(&tags);
+                    match collected_tags.as_mut() {
+                        Some(existing) => existing.extend_from_shared(&tags),
+                        None => collected_tags = Some(tags),
+                    }
                 } else {
                     trace!(
                         ?entity_id,
@@ -188,7 +264,7 @@ impl DogStatsDOriginTagResolver {
         } else {
             if tag_cardinality == OriginTagCardinality::None {
                 trace!("Skipping origin enrichment for metric with cardinality 'none'.");
-                return collected_tags;
+                return SharedTagSet::default();
             }
 
             // Evaluate all available entity IDs in order of priority: Local Data-based container ID, sender entity,
@@ -205,8 +281,7 @@ impl DogStatsDOriginTagResolver {
             for entity_id in maybe_entity_ids.iter().flatten() {
                 if let Some(tags) = self.workload_provider.get_tags_for_entity(entity_id, tag_cardinality) {
                     if !tags.is_empty() {
-                        collected_tags.extend_from_shared(&tags);
-                        break;
+                        return tags;
                     }
                 } else {
                     trace!(
@@ -218,7 +293,7 @@ impl DogStatsDOriginTagResolver {
             }
         }
 
-        collected_tags
+        collected_tags.unwrap_or_default()
     }
 
     fn collect_origin_tags(&self, origin: &ResolvedOrigin) -> SharedTagSet {
@@ -294,10 +369,20 @@ pub fn origin_from_packet<'a>(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::{
+        collections::HashMap,
+        num::NonZeroUsize,
+        sync::{atomic::AtomicUsize, Mutex},
+    };
 
     use saluki_core::data_model::tags::{RawTags, TagSet};
-    use saluki_env::workload::{origin::ResolvedExternalData, providers::TestWorkloadProvider, EntityId};
+    use saluki_env::workload::{
+        aggregator::MetadataStore,
+        origin::{OriginResolver, ResolvedExternalData},
+        providers::TestWorkloadProvider,
+        stores::{ExternalDataStore, TagStore, TagStoreQuerier},
+        EntityId, MetadataAction, MetadataOperation,
+    };
     use stringtheory::MetaString;
 
     use super::*;
@@ -365,6 +450,138 @@ mod tests {
             ..OriginEnrichmentConfiguration::for_test()
         };
         DogStatsDOriginTagResolver::new(config, Arc::new(workload_provider), captured_tagger)
+    }
+
+    #[test]
+    fn origin_tags_follow_provider_updates_for_the_same_origin() {
+        struct MutableWorkload(Mutex<TestWorkloadProvider>);
+
+        impl WorkloadProvider for MutableWorkload {
+            fn get_tags_for_entity(
+                &self, entity_id: &EntityId, cardinality: OriginTagCardinality,
+            ) -> Option<SharedTagSet> {
+                self.0.lock().unwrap().get_tags_for_entity(entity_id, cardinality)
+            }
+
+            fn get_resolved_origin(&self, origin: RawOrigin<'_>) -> Option<ResolvedOrigin> {
+                self.0.lock().unwrap().get_resolved_origin(origin)
+            }
+        }
+
+        for unified in [false, true] {
+            let provider = Arc::new(MutableWorkload(Mutex::new(TestWorkloadProvider::new())));
+            let config = OriginEnrichmentConfiguration {
+                enabled: true,
+                origin_detection_unified: unified,
+                ..OriginEnrichmentConfiguration::for_test()
+            };
+            let resolver = DogStatsDOriginTagResolver::new(config, provider.clone(), CapturedTaggerHandle::new());
+            let mut origin = RawOrigin::default();
+            origin.set_local_data("ci-local-cid");
+
+            assert!(resolver.resolve_origin_tags(origin.clone()).is_empty());
+            for tag in ["version:old", "version:new"] {
+                provider.0.lock().unwrap().add_entity(EID_LOCAL_CID.clone(), &[tag]);
+                let tags = resolver.resolve_origin_tags(origin.clone());
+                assert_eq!(tags.len(), 1);
+                assert!(tags.has_tag(tag));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn origin_tag_cache_refreshes_after_live_metadata_operations() {
+        struct CountingWorkload {
+            tags: TagStoreQuerier,
+            origins: OriginResolver,
+            tag_reads: AtomicUsize,
+        }
+
+        impl WorkloadProvider for CountingWorkload {
+            fn get_tags_for_entity(
+                &self, entity_id: &EntityId, cardinality: OriginTagCardinality,
+            ) -> Option<SharedTagSet> {
+                self.tag_reads.fetch_add(1, Ordering::Relaxed);
+                self.tags.get_entity_tags(entity_id, cardinality)
+            }
+
+            fn tag_generation(&self) -> Option<u64> {
+                self.tags.tag_generation()
+            }
+
+            fn get_resolved_origin(&self, origin: RawOrigin<'_>) -> Option<ResolvedOrigin> {
+                self.origins.get_resolved_origin(origin)
+            }
+        }
+
+        fn set_tags(entity_id: &EntityId, tag: &str) -> MetadataOperation {
+            let mut tags = TagSet::default();
+            tags.insert_tag(tag);
+            MetadataOperation {
+                entity_id: entity_id.clone(),
+                actions: MetadataAction::SetTags {
+                    cardinality: OriginTagCardinality::Low,
+                    tags,
+                }
+                .into(),
+            }
+        }
+
+        let entity_limit = NonZeroUsize::new(10).unwrap();
+        let mut store = TagStore::with_entity_limit(entity_limit);
+        let provider = Arc::new(CountingWorkload {
+            tags: store.querier(),
+            origins: OriginResolver::new(ExternalDataStore::with_entity_limit(entity_limit).resolver()),
+            tag_reads: AtomicUsize::new(0),
+        });
+        let config = OriginEnrichmentConfiguration {
+            enabled: true,
+            ..OriginEnrichmentConfiguration::for_test()
+        };
+        let resolver = DogStatsDOriginTagResolver::new(config, provider.clone(), CapturedTaggerHandle::new());
+        let mut origin = RawOrigin::default();
+        origin.set_local_data("ci-local-cid");
+        let pinned = ProcessOrigin::Pinned(Some(EID_LOCAL_POD.clone()));
+
+        store.process_operation(set_tags(&EID_LOCAL_POD, "sender:pinned"));
+        store.process_operation(set_tags(&EID_EXTERNAL_CID_VALID, "version:alias"));
+        let steps = [
+            (set_tags(&EID_LOCAL_CID, "version:old"), Some("version:old")),
+            (set_tags(&EID_LOCAL_CID, "version:new"), Some("version:new")),
+            (
+                MetadataOperation::add_alias(EID_LOCAL_CID.clone(), EID_EXTERNAL_CID_VALID.clone()),
+                Some("version:alias"),
+            ),
+            (
+                MetadataOperation::remove_alias(EID_LOCAL_CID.clone(), EID_EXTERNAL_CID_VALID.clone()),
+                Some("version:new"),
+            ),
+            (MetadataOperation::delete(EID_LOCAL_CID.clone()), None),
+        ];
+
+        for (index, (operation, tag)) in steps.into_iter().enumerate() {
+            store.process_operation(operation);
+            let mut expected = single_tag("sender:pinned");
+            if let Some(tag) = tag {
+                expected.extend_from_shared(&single_tag(tag));
+            }
+
+            for lookup in ["first lookup", "stable hit"] {
+                let actual = resolver.resolve_origin_tags_with_process_origin(origin.clone(), Some(&pinned));
+                assert_eq!(actual, expected, "metadata step {index}, {lookup}");
+                assert_eq!(
+                    provider.tag_reads.load(Ordering::Relaxed),
+                    2 * (index + 1),
+                    "tag reads after metadata step {index}, {lookup}"
+                );
+            }
+        }
+
+        let other_pin = ProcessOrigin::Pinned(Some(EID_EXTERNAL_CID_VALID.clone()));
+        assert_eq!(
+            resolver.resolve_origin_tags_with_process_origin(origin, Some(&other_pin)),
+            single_tag("version:alias")
+        );
     }
 
     #[test]
@@ -647,10 +864,7 @@ mod tests {
 
     #[test]
     fn resolve_origin_tags_live_path_resolves_tags_via_workload_provider() {
-        // Exercises the real, non-replay production entry point: `resolve_origin_tags` asks the workload provider to
-        // resolve the raw origin, then walks the resolved entity IDs to collect tags. Every other test either drives
-        // the internal `collect_origin_tags` directly or takes the replay bypass, so this is the only coverage of the
-        // live `get_resolved_origin` -> `collect_origin_tags` path through the trait method.
+        // A live process ID resolves through the workload provider, not the captured tagger.
         let mut workload_provider = TestWorkloadProvider::new();
         workload_provider.add_entity_shared_tags(EntityId::ContainerPid(4242), single_tag("tag_source:live-pid"));
         let resolver = enabled_resolver(
