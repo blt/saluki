@@ -14,10 +14,8 @@ use saluki_common::{
 /// resulting in the same overall hash. This function is _not_ oblivious to the actual tag values themselves, though, so
 /// differences such as case (lower vs upper) or leading/trailing whitespace will influence the resulting hash.
 ///
-/// If a tag is seen more than once, it will be ignored and not included in the overall hash. This function allocates a
-/// hash set in order to track which tags have already been hashed, so it's preferable to allocate a single
-/// [`PrehashedHashSet`] and use it with [`hash_context_with_host_and_seen`] in order to amortize the cost of allocating
-/// the hash set.
+/// If a tag is seen more than once, it will be ignored and not included in the overall hash. For large tag sets,
+/// prefer to reuse a [`PrehashedHashSet`] with [`hash_context_with_host_and_seen`] to amortize its allocation.
 ///
 /// Returns a hash that uniquely identifies the combination of name, tags, and origin of the value.
 pub fn hash_context<I, I2, T, T2>(name: &str, tags: I, origin_tags: I2) -> (ContextKey, TagSetKey)
@@ -42,9 +40,7 @@ where
 /// differences such as case (lower vs upper) or leading/trailing whitespace will influence the resulting hash. The host
 /// and metric name are order-dependent scalar context fields, not tags.
 ///
-/// If a tag is seen more than once, it will be ignored and not included in the overall hash. This function requires the
-/// caller to provide the hash set used for tracking duplicates, and is more efficient than `hash_context` which
-/// allocates a new hash set each time.
+/// If a tag is seen more than once, it will be ignored and not included in the overall hash.
 ///
 /// Returns a hash that uniquely identifies the combination of name, host, tags, and origin of the value. An unset host
 /// and an explicitly empty host are distinct contexts.
@@ -70,48 +66,15 @@ where
     I2: IntoIterator<Item = T2>,
     T2: AsRef<str>,
 {
-    seen.clear();
-
     let mut hasher = get_fast_hasher();
 
-    // Hash the metric name and host.
     name.hash(&mut hasher);
     host.hash(&mut hasher);
 
-    // Hash the metric tags individually and XOR their hashes together, which allows us to be order-oblivious:
-    let mut combined_tags_hash = 0;
-
-    for tag in tags {
-        let tag_hash = hash_single_fast(tag.as_ref());
-
-        // If we've already seen this tag before, skip combining it again.
-        if !seen.insert(tag_hash) {
-            continue;
-        }
-
-        combined_tags_hash ^= tag_hash;
-    }
-
+    let combined_tags_hash = hash_tags(tags, seen);
     hasher.write_u64(combined_tags_hash);
 
-    // Finally, hash the origin tags.
-    //
-    // We also hash these in an order-oblivious manner.
-    seen.clear();
-    let mut combined_origin_tags_hash = 0;
-
-    for tag in origin_tags {
-        let tag_hash = hash_single_fast(tag.as_ref());
-
-        // If we've already seen this tag before, skip combining it again.
-        if !seen.insert(tag_hash) {
-            continue;
-        }
-
-        combined_origin_tags_hash ^= tag_hash;
-    }
-
-    hasher.write_u64(combined_origin_tags_hash);
+    hasher.write_u64(hash_tags(origin_tags, seen));
 
     let context_key = ContextKey { hash: hasher.finish() };
     let tagset_key = TagSetKey {
@@ -119,6 +82,52 @@ where
     };
 
     (context_key, tagset_key)
+}
+
+/// XORs the distinct tag hashes. Tags and origin tags use independent deduplication scopes.
+#[inline]
+fn hash_tags<I, T>(tags: I, seen: &mut PrehashedHashSet<u64>) -> u64
+where
+    I: IntoIterator<Item = T>,
+    T: AsRef<str>,
+{
+    const STACK_CAPACITY: usize = 16;
+
+    let mut hashes = tags.into_iter().map(|tag| hash_single_fast(tag.as_ref()));
+    let mut combined = 0;
+
+    if hashes.size_hint().0 <= STACK_CAPACITY {
+        let mut inline = [0; STACK_CAPACITY];
+        let mut len = 0;
+        loop {
+            let Some(hash) = hashes.next() else {
+                return combined;
+            };
+            if inline[..len].contains(&hash) {
+                continue;
+            }
+            combined ^= hash;
+            if len == STACK_CAPACITY {
+                // Transfer the hashes already seen without rehashing their strings.
+                seen.clear();
+                seen.extend(inline);
+                seen.insert(hash);
+                break;
+            }
+            inline[len] = hash;
+            len += 1;
+        }
+    } else {
+        seen.clear();
+    }
+
+    for hash in hashes {
+        if seen.insert(hash) {
+            combined ^= hash;
+        }
+    }
+
+    combined
 }
 
 /// A compact hash key that identifies a metric context.
@@ -132,4 +141,59 @@ pub struct ContextKey {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct TagSetKey {
     hash: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_hash_matches_hash_set_deduplication() {
+        fn baseline_tags(tags: &[String]) -> u64 {
+            tags.iter()
+                .map(|tag| hash_single_fast(tag.as_str()))
+                .collect::<PrehashedHashSet<_>>()
+                .into_iter()
+                .fold(0, |combined, hash| combined ^ hash)
+        }
+
+        let name = "sample.metric";
+        let mut seen = PrehashedHashSet::default();
+        for (regular_count, origin_count) in [(0, 0), (16, 17), (17, 16), (17, 18), (2, 1)] {
+            let build_tags = |count| {
+                let mut tags: Vec<_> = (0..count).map(|i| format!("tag:{i}")).collect();
+                if let Some(first) = tags.first() {
+                    tags.push(first.clone());
+                }
+                tags
+            };
+            let tags = build_tags(regular_count);
+            let mut origin_tags = build_tags(origin_count);
+            origin_tags.reverse();
+
+            for host in [None, Some(""), Some("my-host")] {
+                let tags_hash = baseline_tags(&tags);
+                let mut hasher = get_fast_hasher();
+                name.hash(&mut hasher);
+                host.hash(&mut hasher);
+                hasher.write_u64(tags_hash);
+                hasher.write_u64(baseline_tags(&origin_tags));
+
+                let (context_key, tagset_key) =
+                    hash_context_with_host_and_seen(name, host, &tags, &origin_tags, &mut seen);
+                assert_eq!(context_key.hash, hasher.finish());
+                assert_eq!(tagset_key.hash, tags_hash);
+
+                // Filters hide the length, forcing large inputs to spill from the stack while hashing.
+                let streaming = hash_context_with_host_and_seen(
+                    name,
+                    host,
+                    tags.iter().filter(|_| true),
+                    origin_tags.iter().filter(|_| true),
+                    &mut seen,
+                );
+                assert_eq!(streaming, (context_key, tagset_key));
+            }
+        }
+    }
 }

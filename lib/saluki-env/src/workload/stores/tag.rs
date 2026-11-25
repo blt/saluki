@@ -1,4 +1,10 @@
-use std::{num::NonZeroUsize, sync::Arc};
+use std::{
+    num::NonZeroUsize,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
 
 use saluki_common::collections::{FastConcurrentHashMap, FastConcurrentHashSet};
 use saluki_core::{
@@ -75,6 +81,7 @@ pub struct TagStore {
     active_entities: Arc<FastConcurrentHashSet<EntityId>>,
     entity_aliases: Arc<FastConcurrentHashMap<EntityId, EntityId>>,
     entity_tags: TagStorage,
+    generation: Arc<AtomicU64>,
     telemetry: Telemetry,
 }
 
@@ -92,6 +99,7 @@ impl TagStore {
             active_entities: Arc::new(FastConcurrentHashSet::default()),
             entity_aliases: Arc::new(FastConcurrentHashMap::default()),
             entity_tags: TagStorage::default(),
+            generation: Arc::default(),
             telemetry,
         }
     }
@@ -163,6 +171,7 @@ impl TagStore {
             entity_tags: self.entity_tags.clone(),
             entities: Arc::clone(&self.active_entities),
             aliases: Arc::clone(&self.entity_aliases),
+            generation: Arc::clone(&self.generation),
         }
     }
 }
@@ -174,6 +183,9 @@ impl MetadataStore for TagStore {
 
     fn process_operation(&mut self, operation: MetadataOperation) {
         debug!(?operation, "Processing metadata operation.");
+
+        // Odd generations mark operations in progress. Publish the new even generation after all actions.
+        self.generation.fetch_add(1, Ordering::AcqRel);
 
         // TODO: Maybe come up with a better pattern for doing "only clone for the first N-1 actions, don't clone for the
         // Nth" since we're needlessly cloning a lot with this current approach.
@@ -200,6 +212,7 @@ impl MetadataStore for TagStore {
                 MetadataAction::AttachExternalData { .. } => {}
             }
         }
+        self.generation.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -241,9 +254,16 @@ pub struct TagStoreQuerier {
     entity_tags: TagStorage,
     entities: Arc<FastConcurrentHashSet<EntityId>>,
     aliases: Arc<FastConcurrentHashMap<EntityId, EntityId>>,
+    generation: Arc<AtomicU64>,
 }
 
 impl TagStoreQuerier {
+    /// Gets the current tag and alias generation, or `None` while a metadata operation is in progress.
+    pub fn tag_generation(&self) -> Option<u64> {
+        let generation = self.generation.load(Ordering::Acquire);
+        (generation & 1 == 0).then_some(generation)
+    }
+
     /// Gets all tags for an entity at the requested cardinality and below.
     ///
     /// This means that tags from the requested cardinality, and all lower precedence cardinality levels, will be
