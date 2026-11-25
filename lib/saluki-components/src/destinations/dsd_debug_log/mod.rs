@@ -99,8 +99,8 @@ impl DogStatsDDebugLog {
 
         let context = metric.context();
         let metric_context = ContextNoOrigin {
-            name: context.name().clone(),
-            tags: context.tags().clone(),
+            name: context.name().into(),
+            tags: context.tags().to_mutable(),
         };
 
         let timestamp = saluki_common::time::get_coarse_unix_timestamp();
@@ -113,7 +113,7 @@ impl DogStatsDDebugLog {
         let line = format!(
             "Metric Name: {} | Tags: {{{}}} | Count: {} | Last Seen: {}\n",
             context.name(),
-            format_tags(context.tags()),
+            format_tags(context.tags().strings()),
             sample.count,
             format_timestamp(sample.last_seen)
         );
@@ -197,14 +197,14 @@ impl MemoryBounds for DogStatsDDebugLogConfiguration {
     }
 }
 
-fn format_tags(tags: &TagSet) -> String {
+fn format_tags<'a>(tags: impl Iterator<Item = &'a str>) -> String {
     let mut formatted = String::new();
 
     for tag in tags {
         if !formatted.is_empty() {
             formatted.push(' ');
         }
-        formatted.push_str(tag.as_str());
+        formatted.push_str(tag);
     }
 
     formatted
