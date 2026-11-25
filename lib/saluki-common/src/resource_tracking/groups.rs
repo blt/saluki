@@ -254,7 +254,7 @@ impl<T: Sized> Track for T {}
 ///
 /// Currently, only Linux is supported for CPU usage tracking.
 pub struct ResourceGroupRegistry {
-    resource_groups: Mutex<HashMap<String, Box<ResourceStats>>>,
+    resource_groups: Mutex<HashMap<String, std::sync::Arc<ResourceStats>>>,
 }
 
 impl ResourceGroupRegistry {
@@ -290,10 +290,10 @@ impl ResourceGroupRegistry {
         in_root_resource_group(|| {
             let mut resource_groups = self.resource_groups.lock().unwrap();
             match resource_groups.get(name.as_ref()) {
-                Some(stats) => ResourceGroupToken::new(NonNull::from(&**stats)),
+                Some(stats) => ResourceGroupToken::new(NonNull::from(stats.as_ref())),
                 None => {
-                    let resource_group_stats = Box::new(ResourceStats::new());
-                    let token = ResourceGroupToken::new(NonNull::from(&*resource_group_stats));
+                    let resource_group_stats = std::sync::Arc::new(ResourceStats::new());
+                    let token = ResourceGroupToken::new(NonNull::from(resource_group_stats.as_ref()));
 
                     resource_groups.insert(name.as_ref().to_string(), resource_group_stats);
 
