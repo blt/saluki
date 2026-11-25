@@ -1,0 +1,3 @@
+fixes:
+  - |
+    Disable the DogStatsD tag-set cache when ``dogstatsd_cached_tagsets_limit`` is ``0``.
