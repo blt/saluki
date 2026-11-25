@@ -1,5 +1,5 @@
 use std::{
-    alloc::{alloc, dealloc, handle_alloc_error, Layout},
+    alloc::{alloc, dealloc, handle_alloc_error, GlobalAlloc, Layout},
     mem::ManuallyDrop,
     ptr::NonNull,
     slice, str,
@@ -11,7 +11,7 @@ use std::{
 
 use hashbrown::HashSet;
 use metrics::Gauge;
-use saluki_common::hash::FastBuildHasher;
+use saluki_common::{hash::FastBuildHasher, resource_tracking::ComponentAllocator};
 use smallvec::SmallVec;
 use stringtheory::{
     interning::{Symbol, SymbolTable},
@@ -38,6 +38,7 @@ static EMPTY_ORIGIN: LazyLock<TagSet> = LazyLock::new(TagSet::default);
 pub(super) struct Domain {
     pub(super) symbols: Arc<SymbolTable>,
     pub(super) active: Gauge,
+    pub(super) allocator: Option<ComponentAllocator>,
 }
 
 // Hold the interner reservations while heap fallback is disabled.
@@ -100,7 +101,7 @@ impl TagMetadata {
 }
 
 // Optional origin handle, inline name/host bytes, mixed bitmap, then tag records.
-// Only weak refcounts and layout metadata remain usable after the last strong reference drops.
+// Weak references keep the allocation metadata and the owner's allocator live.
 #[repr(C)]
 struct Header {
     strong: AtomicUsize,
@@ -254,7 +255,10 @@ impl Packed {
         };
         // SAFETY: The layout is nonzero; each tail region is disjoint and sized above.
         let ptr = unsafe {
-            let ptr = alloc(layout);
+            let ptr = match domain.and_then(|domain| domain.allocator.as_ref()) {
+                Some(allocator) => allocator.alloc(layout),
+                None => alloc(layout),
+            };
             let header_ptr = NonNull::new(ptr.cast::<Header>()).unwrap_or_else(|| handle_alloc_error(layout));
             header_ptr.as_ptr().write(header);
             let mut cursor = ptr.add(size_of::<Header>());
@@ -470,7 +474,6 @@ impl Drop for Packed {
             if header.has(ORIGIN) {
                 self.0.as_ptr().add(1).cast::<TagSet>().drop_in_place();
             }
-            ManuallyDrop::drop(&mut (*self.0.as_ptr()).domain);
         }
         drop(WeakPacked(self.0));
     }
@@ -513,7 +516,12 @@ impl Drop for WeakPacked {
             let ptr = self.0.as_ptr();
             if (*ptr).weak.fetch_sub(1, Ordering::Release) == 1 {
                 fence(Ordering::Acquire);
-                dealloc(ptr.cast(), Header::layout((*ptr).bytes as usize));
+                let layout = Header::layout((*ptr).bytes as usize);
+                let domain = ManuallyDrop::take(&mut (*ptr).domain);
+                match domain.as_deref().and_then(|domain| domain.allocator.as_ref()) {
+                    Some(allocator) => allocator.dealloc(ptr.cast(), layout),
+                    None => dealloc(ptr.cast(), layout),
+                }
             }
         }
     }

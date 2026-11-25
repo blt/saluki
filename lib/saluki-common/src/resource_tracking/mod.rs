@@ -27,6 +27,6 @@ mod allocator;
 mod groups;
 mod stats;
 
-pub use self::allocator::TrackingAllocator;
+pub use self::allocator::{ComponentAllocator, TrackingAllocator};
 pub use self::groups::{ResourceGroupRegistry, ResourceGroupToken, ResourceTrackingGuard, Track, Tracked};
 pub use self::stats::{ResourceStats, ResourceStatsSnapshot};
