@@ -1,25 +1,13 @@
 use saluki_core::{
     constants::datadog::*,
-    data_model::{
-        origin::OriginTagCardinality,
-        tags::{BorrowedTag, RawTags},
-    },
+    data_model::{origin::OriginTagCardinality, tags::RawTags},
 };
 use smallvec::SmallVec;
 
 /// Regular (non-well-known) tags from a DogStatsD payload.
 ///
-/// As an optimization, up to 32 tags are stored inline without allocating. This isn't a limit on the number of tags:
-/// any beyond that are stored on the heap.
-pub type RegularTags<'a> = SmallVec<[&'a str; 32]>;
-
-/// Returns `true` if the given tag is a well-known tag.
-fn is_well_known_tag(tag: &str) -> bool {
-    tag.starts_with(HOST_TAG_KEY_SUFFIXED)
-        || tag.starts_with(ENTITY_ID_TAG_KEY_SUFFIXED)
-        || tag.starts_with(JMX_CHECK_NAME_TAG_KEY_SUFFIXED)
-        || tag.starts_with(CARDINALITY_TAG_KEY_SUFFIXED)
-}
+/// Stores up to 64 tags inline. Additional tags use heap storage.
+pub type RegularTags<'a> = SmallVec<[&'a str; 64]>;
 
 /// Well-known tags shared across DogStatsD payloads.
 ///
@@ -46,28 +34,34 @@ impl<'a> WellKnownTags<'a> {
         let mut regular_tags = RegularTags::new();
 
         for tag in tags.iter() {
-            if !is_well_known_tag(tag) {
-                regular_tags.push(tag);
-                continue;
-            }
-
-            match BorrowedTag::from(tag).name_and_value() {
-                (HOST_TAG_KEY, Some(hostname)) => {
-                    well_known_tags.hostname = Some(hostname);
+            match tag.as_bytes().first() {
+                Some(b'h') => {
+                    if let Some(hostname) = tag.strip_prefix(HOST_TAG_KEY_SUFFIXED) {
+                        well_known_tags.hostname = Some(hostname);
+                        continue;
+                    }
                 }
-                (ENTITY_ID_TAG_KEY, Some(entity_id)) if entity_id != ENTITY_ID_IGNORE_VALUE => {
-                    well_known_tags.pod_uid = Some(entity_id);
-                }
-                (JMX_CHECK_NAME_TAG_KEY, Some(name)) => {
-                    well_known_tags.jmx_check_name = Some(name);
-                }
-                (CARDINALITY_TAG_KEY, Some(value)) => {
-                    if let Ok(card) = OriginTagCardinality::try_from(value) {
-                        well_known_tags.cardinality = Some(card);
+                Some(b'd') => {
+                    if let Some(entity_id) = tag.strip_prefix(ENTITY_ID_TAG_KEY_SUFFIXED) {
+                        if entity_id != ENTITY_ID_IGNORE_VALUE {
+                            well_known_tags.pod_uid = Some(entity_id);
+                        }
+                        continue;
+                    }
+                    if let Some(name) = tag.strip_prefix(JMX_CHECK_NAME_TAG_KEY_SUFFIXED) {
+                        well_known_tags.jmx_check_name = Some(name);
+                        continue;
+                    }
+                    if let Some(value) = tag.strip_prefix(CARDINALITY_TAG_KEY_SUFFIXED) {
+                        if let Ok(card) = OriginTagCardinality::try_from(value) {
+                            well_known_tags.cardinality = Some(card);
+                        }
+                        continue;
                     }
                 }
                 _ => {}
             }
+            regular_tags.push(tag);
         }
 
         (well_known_tags, regular_tags)
@@ -144,5 +138,25 @@ mod tests {
         assert_eq!(wkt.pod_uid, None);
         assert_eq!(wkt.cardinality, None);
         assert_eq!(wkt.jmx_check_name, Some("check"));
+    }
+
+    #[test]
+    fn well_known_tag_values_keep_suffixes_and_ignore_invalid_overrides() {
+        let tags = format!(
+            "host:old,host:new:port,dd.internal.entity_id:pod,dd.internal.entity_id:{ENTITY_ID_IGNORE_VALUE},\
+             dd.internal.card:low,dd.internal.card:bad,dd.internal.jmx_check_name:,dd.internal.jmx_check_name:x:y,\
+             ,dd.internal.card.extra:keep,jmx_check_name:keep"
+        );
+        let tags = RawTags::new(&tags, usize::MAX, usize::MAX);
+        let (wkt, regular_tags) = WellKnownTags::split_raw_tags(&tags);
+
+        assert_eq!(wkt.hostname, Some("new:port"));
+        assert_eq!(wkt.pod_uid, Some("pod"));
+        assert_eq!(wkt.cardinality, Some(OriginTagCardinality::Low));
+        assert_eq!(wkt.jmx_check_name, Some("x:y"));
+        assert_eq!(
+            regular_tags.as_slice(),
+            ["", "dd.internal.card.extra:keep", "jmx_check_name:keep"]
+        );
     }
 }
