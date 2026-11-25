@@ -1,6 +1,11 @@
 use std::{num::NonZeroUsize, sync::Arc, time::Duration};
 
-use saluki_common::{collections::PrehashedHashSet, hash::NoopU64BuildHasher, sync::shutdown::ShutdownHandle};
+use saluki_common::{
+    collections::PrehashedHashSet,
+    hash::NoopU64BuildHasher,
+    resource_tracking::{ComponentAllocator, ResourceGroupToken},
+    sync::shutdown::ShutdownHandle,
+};
 use saluki_error::{generic_error, GenericError};
 use saluki_metrics::{static_metrics, Counter, Gauge};
 use smallvec::SmallVec;
@@ -274,6 +279,7 @@ impl ContextResolverBuilder {
         let domain = Arc::new(Domain {
             symbols,
             active: telemetry.active_contexts().clone(),
+            allocator: ComponentAllocator::new(ResourceGroupToken::current()),
         });
 
         // The background tasks of this resolver run in a scope that the resolver owns. The caches that the resolver

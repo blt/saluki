@@ -7,11 +7,48 @@
 use std::{
     alloc::{GlobalAlloc, Layout},
     ptr,
+    sync::OnceLock,
 };
 
-use super::{groups::CURRENT_GROUP, stats::ResourceStats};
+use super::{groups::CURRENT_GROUP, stats::ResourceStats, ResourceGroupToken};
 
 const STATS_LAYOUT: Layout = Layout::new::<*const ResourceStats>();
+static DIRECT_BACKEND: OnceLock<&'static (dyn GlobalAlloc + Sync)> = OnceLock::new();
+
+/// An allocator for storage whose owner is known without an allocation trailer.
+///
+/// Use the same allocator value to free an allocation, even from a different resource group.
+#[derive(Clone, Copy)]
+pub struct ComponentAllocator {
+    group: ResourceGroupToken,
+    backend: &'static (dyn GlobalAlloc + Sync),
+}
+
+impl ComponentAllocator {
+    /// Creates a trailer-free allocator for `group` if the process has installed a direct backend.
+    pub fn new(group: ResourceGroupToken) -> Option<Self> {
+        Some(Self {
+            group,
+            backend: *DIRECT_BACKEND.get()?,
+        })
+    }
+}
+
+// SAFETY: The backend is fixed for the life of this value. Caller-provided layout and pointer are unchanged.
+unsafe impl GlobalAlloc for ComponentAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let ptr = self.backend.alloc(layout);
+        if !ptr.is_null() {
+            self.group.stats().track_allocation(layout.size());
+        }
+        ptr
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        self.group.stats().track_deallocation(layout.size());
+        self.backend.dealloc(ptr, layout);
+    }
+}
 
 /// A global allocator that tracks allocations on a per-group basis.
 ///
@@ -53,6 +90,16 @@ impl<A> TrackingAllocator<A> {
     /// purely for tracking the allocations and deallocations themselves.
     pub const fn new(allocator: A) -> Self {
         Self { allocator }
+    }
+
+    /// Makes the wrapped allocator available to component allocators created after this call.
+    ///
+    /// Call this on the global tracking allocator at application startup, before building components.
+    pub fn install_component_backend(&'static self)
+    where
+        A: GlobalAlloc + Sync,
+    {
+        DIRECT_BACKEND.get_or_init(|| &self.allocator);
     }
 }
 

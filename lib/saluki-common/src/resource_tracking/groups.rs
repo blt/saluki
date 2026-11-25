@@ -42,6 +42,11 @@ impl ResourceGroupToken {
         })
     }
 
+    pub(super) fn stats(&self) -> &'static ResourceStats {
+        // SAFETY: Registered groups are never removed, and the root group is static.
+        unsafe { self.group_ptr.as_ref() }
+    }
+
     #[cfg(test)]
     fn ptr_eq(&self, other: &Self) -> bool {
         self.group_ptr == other.group_ptr
