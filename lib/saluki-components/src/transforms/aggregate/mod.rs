@@ -33,6 +33,10 @@ use tracing::{debug, error, info, trace, warn};
 mod telemetry;
 use self::telemetry::{origin_telemetry_bytes, FlushCounts, OriginContextId, Telemetry};
 
+#[cfg(test)]
+#[allow(dead_code)]
+mod storage;
+
 mod config;
 pub use self::config::HistogramConfiguration;
 use self::config::HistogramStatistic;
