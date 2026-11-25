@@ -8,7 +8,7 @@ use saluki_api::{DynamicRoute, EndpointType};
 use saluki_common::resource_tracking::{ResourceGroupRegistry, ResourceStats, ResourceStatsSnapshot};
 use saluki_common::{collections::FastHashMap, sync::shutdown::ShutdownHandle};
 use saluki_core::accounting::{
-    ComponentBounds, ComponentRegistry, ComponentRegistryHandle, MemoryGrant, MemoryLimiter,
+    ByteBudget, CgroupMemory, ComponentBounds, ComponentRegistry, ComponentRegistryHandle, MemoryGrant, MemoryLimiter,
 };
 use saluki_core::{
     diagnostic::DiagnosticsEmitter,
@@ -23,7 +23,7 @@ use tracing::{error, info, warn};
 /// Bounds validation and global memory limiter behavior.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum MemoryMode {
-    /// Bounds validation is skipped, and no memory limiting is applied.
+    /// Bounds verification and cooperative backpressure are disabled.
     #[default]
     Disabled,
 
@@ -72,6 +72,9 @@ pub struct MemoryBoundsConfiguration {
 /// When no memory limit is configured and `DOCKER_DD_AGENT` is set to a non-empty value, the limit is read from the
 /// process cgroup instead.
 ///
+/// DogStatsD byte-budget admission uses the configured limit or cgroup v2 limit, whichever is lower, independently
+/// of the bounds verification and backpressure settings.
+///
 /// See [`MemoryMode`] for details on the behavior of each mode.
 ///
 /// # Errors
@@ -90,7 +93,7 @@ pub fn initialize_memory_bounds(
 
     let limiter_grant = match configuration.memory_mode {
         MemoryMode::Disabled => {
-            info!("Memory limiting disabled.");
+            info!("Memory bounds verification and cooperative backpressure disabled.");
             None
         }
         mode @ (MemoryMode::Permissive | MemoryMode::Strict) => match configured_grant {
@@ -111,7 +114,22 @@ pub fn initialize_memory_bounds(
         _ => MemoryLimiter::noop(),
     };
 
-    Ok(limiter)
+    // Admission remains active even when the independently configured cooperative backoff is disabled.
+    let cgroup = CgroupMemory::detect();
+    let budget = match (memory_limit, cgroup) {
+        (configured, Some(cgroup)) => {
+            let limit = configured.map_or(cgroup.limit(), |limit| (limit.as_u64() as usize).min(cgroup.limit()));
+            ByteBudget::for_memory_limit(limit, move || cgroup.current())
+                .ok_or_else(|| generic_error!("Cgroup memory usage cannot be monitored for byte-budget admission."))?
+                .into()
+        }
+        (Some(limit), None) => ByteBudget::for_process_memory_limit(limit.as_u64() as usize)
+            .ok_or_else(|| generic_error!("Process memory usage cannot be monitored for byte-budget admission."))?
+            .into(),
+        (None, None) => None,
+    };
+
+    Ok(limiter.with_byte_budget(budget))
 }
 
 fn verify_bounds_for_mode(
@@ -433,11 +451,15 @@ mod tests {
     fn disabled_memory_mode_skips_bounds_verification() {
         let registry = registry_with_firm_bound(64 * 1024 * 1024);
 
-        initialize_memory_bounds(
+        let limiter = initialize_memory_bounds(
             config_with_limit(ByteSize::b(1024), MemoryMode::Disabled),
             registry.root(),
         )
         .expect("disabled mode should not verify bounds");
+        assert!(
+            limiter.byte_budget().is_some(),
+            "an explicit limit enables admission without backoff"
+        );
     }
 
     #[test]
