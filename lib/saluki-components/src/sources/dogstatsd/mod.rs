@@ -1406,7 +1406,10 @@ async fn receive_connected_stream(
             }
             None => acquire_io_buffer(&io_buffer_pool).await,
         };
-        let (bytes_read, peer_addr) = match stream.receive(&mut buffer).await {
+        let (bytes_read, peer_addr) = match stream
+            .receive_with_credential_check(&mut buffer, || origin_detection_enabled || traffic_capture.is_ongoing())
+            .await
+        {
             Ok(received) => received,
             Err(error) => {
                 let _ = packets_tx.send(Err(error)).await;
@@ -1449,7 +1452,10 @@ async fn receive_connectionless_stream(
         memory_limiter.wait_for_capacity().await;
 
         let mut buffer = acquire_io_buffer(&io_buffer_pool).await;
-        let result = match stream.receive(&mut buffer).await {
+        let result = match stream
+            .receive_with_credential_check(&mut buffer, || origin_detection_enabled || traffic_capture.is_ongoing())
+            .await
+        {
             Ok((bytes_read, peer_addr)) => {
                 let process_origin = resolve_process_origin_if_needed(
                     origin_detection_enabled,
