@@ -1,0 +1,3 @@
+enhancements:
+  - |
+    Reduce per-context memory overhead in the DogStatsD resolver.
