@@ -18,7 +18,7 @@ use crate::{
         TYPES_FIELD_NUMBER, UNIT_REFS_FIELD_NUMBER, VALS_FLOAT32_FIELD_NUMBER, VALS_FLOAT64_FIELD_NUMBER,
         VALS_SINT64_FIELD_NUMBER,
     },
-    interner::Interner,
+    interner::{Interner, RecentInterner},
     types::{value_type_for_values, V3MetricType, V3ValueType},
 };
 
@@ -146,10 +146,10 @@ pub struct V3Writer {
     name_interner: Interner,
     tag_interner: Interner,
     tagset_interner: Interner,
-    resource_str_interner: Interner,
-    resource_interner: Interner,
+    resource_str_interner: RecentInterner<8>,
+    resource_interner: RecentInterner<2>,
     source_type_interner: Interner,
-    origin_interner: Interner,
+    origin_interner: RecentInterner<1>,
     unit_interner: Interner,
 
     data: V3EncodedData,
@@ -533,10 +533,18 @@ impl V3Writer {
 
         self.resource_ids.clear();
         let arena = &mut self.data.dict_resource_str_bytes;
+        let interner = &mut self.resource_str_interner;
+        let mut intern = |text: &str| {
+            if text.is_empty() {
+                0
+            } else {
+                interner
+                    .get_or_insert(text.as_bytes(), arena, |arena| append_len(arena, text.len()))
+                    .0
+            }
+        };
         for (resource_type, resource_name) in resources {
-            let type_id = intern_string(&mut self.resource_str_interner, arena, resource_type);
-            let name_id = intern_string(&mut self.resource_str_interner, arena, resource_name);
-            self.resource_ids.push((type_id, name_id));
+            self.resource_ids.push((intern(resource_type), intern(resource_name)));
         }
 
         let (id, is_new) = self
