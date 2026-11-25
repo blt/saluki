@@ -1,0 +1,3 @@
+enhancements:
+  - |
+    Reduce allocator and resource accounting overhead while resizing buffers and processing telemetry.
