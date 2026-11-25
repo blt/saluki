@@ -1,57 +1,93 @@
-//! Generic interning for dictionary deduplication.
+//! Exact dictionary indexing over the writer's contiguous column buffers.
 
-use std::{borrow::Borrow, hash::Hash};
+use std::hash::{BuildHasher, Hash};
 
-type FastBuildHasher = foldhash::quality::RandomState;
-type FastHashMap<K, V> = std::collections::HashMap<K, V, FastBuildHasher>;
+use hashbrown::{hash_table::Entry, HashTable};
 
-/// Generic interning structure for dictionary deduplication.
-///
-/// Assigns unique 1-based IDs to values, returning the same ID for duplicate values.
-/// ID 0 is reserved for "empty/none" in the V3 format.
-#[derive(Debug)]
-pub(crate) struct Interner<K: Eq + Hash> {
-    index: FastHashMap<K, i64>,
-    last_id: i64,
+#[derive(Clone, Copy, Debug)]
+struct Record {
+    hash: u64,
+    start: usize,
+    len: usize,
+    id: i64,
 }
 
-impl<K: Eq + Hash> Default for Interner<K> {
-    fn default() -> Self {
-        Self::new()
+type SymbolHint = (usize, u32);
+const SYMBOL_CACHE_SIZE: usize = 256;
+
+#[derive(Clone, Copy, Debug)]
+struct SymbolAlias {
+    hint: SymbolHint,
+    record: Record,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct Interner {
+    index: HashTable<Record>,
+    hasher: foldhash::fast::RandomState,
+    symbols: Option<Box<[Option<SymbolAlias>; SYMBOL_CACHE_SIZE]>>,
+}
+
+impl Interner {
+    /// Returns a 1-based ID; appends the prefix and key only on a miss.
+    pub fn get_or_insert<T: Copy + Eq + Hash>(
+        &mut self, key: &[T], arena: &mut Vec<T>, prefix: impl FnOnce(&mut Vec<T>),
+    ) -> (i64, bool) {
+        let (record, is_new) = self.intern(key, arena, prefix);
+        (record.id, is_new)
     }
-}
 
-impl<K: Eq + Hash> Interner<K> {
-    /// Creates a new empty interner.
-    pub fn new() -> Self {
-        Self {
-            index: FastHashMap::default(),
-            last_id: 0,
+    pub fn intern_symbol(
+        &mut self, hint: SymbolHint, key: &[u8], arena: &mut Vec<u8>, prefix: impl FnOnce(&mut Vec<u8>),
+    ) -> i64 {
+        let (table, id) = hint;
+        let slot = ((table >> 6) ^ id as usize ^ (id >> 28) as usize) % SYMBOL_CACHE_SIZE;
+        if let Some(alias) = self.symbols.as_ref().and_then(|symbols| symbols[slot]) {
+            let record = alias.record;
+            // A symbol ID may be reclaimed while the writer is still live.
+            if alias.hint == hint && arena[record.start..record.start + record.len] == *key {
+                return record.id;
+            }
+        }
+
+        let (record, _) = self.intern(key, arena, prefix);
+        self.symbols.get_or_insert_with(|| Box::new([None; SYMBOL_CACHE_SIZE]))[slot] =
+            Some(SymbolAlias { hint, record });
+        record.id
+    }
+
+    fn intern<T: Copy + Eq + Hash>(
+        &mut self, key: &[T], arena: &mut Vec<T>, prefix: impl FnOnce(&mut Vec<T>),
+    ) -> (Record, bool) {
+        let hash = self.hasher.hash_one(key);
+        let next_id = self.index.len() as i64 + 1;
+        match self.index.entry(
+            hash,
+            |record| record.hash == hash && arena[record.start..record.start + record.len] == *key,
+            |record| record.hash,
+        ) {
+            Entry::Occupied(entry) => (*entry.get(), false),
+            Entry::Vacant(entry) => {
+                prefix(arena);
+                let start = arena.len();
+                arena.extend_from_slice(key);
+                let record = Record {
+                    hash,
+                    start,
+                    len: key.len(),
+                    id: next_id,
+                };
+                entry.insert(record);
+                (record, true)
+            }
         }
     }
 
-    /// Gets the ID for a key, inserting it if not present.
-    ///
-    /// Returns `(id, is_new)` where `is_new` is true if the key was newly inserted.
-    /// IDs are 1-based (0 is reserved for empty/none values).
-    pub fn get_or_insert<Q>(&mut self, key: &Q) -> (i64, bool)
-    where
-        K: Borrow<Q>,
-        Q: ToOwned<Owned = K> + Hash + Eq + ?Sized,
-    {
-        if let Some(&id) = self.index.get(key) {
-            (id, false)
-        } else {
-            self.last_id += 1;
-            self.index.insert(key.to_owned(), self.last_id);
-            (self.last_id, true)
+    pub fn clear(&mut self) {
+        self.index.clear();
+        if let Some(symbols) = &mut self.symbols {
+            symbols.fill(None);
         }
-    }
-
-    /// Returns the number of interned values.
-    #[cfg(test)]
-    pub fn len(&self) -> usize {
-        self.index.len()
     }
 }
 
@@ -60,36 +96,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_interner_basic() {
-        let mut interner: Interner<String> = Interner::new();
+    fn interns_exact_slices_across_growth_and_clear() {
+        let mut index = Interner::default();
+        let mut arena = Vec::new();
+        let prefix = |arena: &mut Vec<i64>| arena.push(-1);
+        assert_eq!(index.get_or_insert(&[1, 2], &mut arena, prefix), (1, true));
+        assert_eq!(index.get_or_insert(&[1], &mut arena, prefix), (2, true));
+        for n in 3..256 {
+            assert_eq!(index.get_or_insert(&[n, n + 1], &mut arena, prefix), (n, true));
+        }
+        assert_eq!(index.get_or_insert(&[1, 2], &mut arena, prefix), (1, false));
+        assert_eq!(&arena[..5], &[-1, 1, 2, -1, 1]);
 
-        // First insertion returns ID 1 and is_new=true
-        let (id1, is_new1) = interner.get_or_insert("hello");
-        assert_eq!(id1, 1);
-        assert!(is_new1);
-
-        // Second insertion of same value returns same ID and is_new=false
-        let (id2, is_new2) = interner.get_or_insert("hello");
-        assert_eq!(id2, 1);
-        assert!(!is_new2);
-
-        // New value gets next ID
-        let (id3, is_new3) = interner.get_or_insert("world");
-        assert_eq!(id3, 2);
-        assert!(is_new3);
-
-        assert_eq!(interner.len(), 2);
+        index.clear();
+        arena.clear();
+        assert_eq!(index.get_or_insert(&[1], &mut arena, prefix), (1, true));
+        assert_eq!(arena, [-1, 1]);
     }
 
     #[test]
-    fn test_interner_tuples() {
-        let mut interner: Interner<(i32, i32, i32)> = Interner::new();
-
-        let (id1, _) = interner.get_or_insert(&(1, 2, 3));
-        let (id2, _) = interner.get_or_insert(&(1, 2, 3));
-        let (id3, _) = interner.get_or_insert(&(4, 5, 6));
-
-        assert_eq!(id1, id2);
-        assert_ne!(id1, id3);
+    fn recycled_symbol_id_does_not_alias_a_different_string() {
+        let mut index = Interner::default();
+        let mut arena = Vec::new();
+        let hint = (11, 123);
+        assert_eq!(index.intern_symbol(hint, b"old", &mut arena, |_| {}), 1);
+        assert_eq!(index.intern_symbol(hint, b"new", &mut arena, |_| {}), 2);
+        assert_eq!(index.get_or_insert(b"old", &mut arena, |_| {}), (1, false));
+        assert_eq!(index.intern_symbol(hint, b"new", &mut arena, |_| {}), 2);
+        assert_eq!(arena, b"oldnew");
     }
 }
