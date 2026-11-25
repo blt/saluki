@@ -1,0 +1,3 @@
+enhancements:
+  - |
+    Avoid copying long Set members when an aggregated metric goes to multiple downstream destinations.
