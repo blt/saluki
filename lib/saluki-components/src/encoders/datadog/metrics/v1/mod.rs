@@ -2,9 +2,11 @@ use http::HeaderValue;
 use saluki_common::iter::ReusableDeduplicator;
 use saluki_core::data_model::{
     event::metric::{Metric, MetricOrigin, MetricValues},
-    tags::{SharedTagSet, Tag},
+    tags::{BorrowedTag, SharedTagSet},
 };
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
+
+use super::metric_tag_strings;
 
 pub(super) const SERIES_COMPRESSED_SIZE_LIMIT: usize = 2_000_000; // ~2 MiB
 pub(super) const SERIES_UNCOMPRESSED_SIZE_LIMIT: usize = 4_000_000; // ~4 MiB
@@ -28,7 +30,7 @@ pub(super) fn has_emittable_point(metric: &Metric) -> bool {
 
 pub(super) fn encode_series_metric(
     metric: &Metric, additional_tags: &SharedTagSet, buffer: &mut Vec<u8>,
-    tags_deduplicator: &mut ReusableDeduplicator<Tag>,
+    tags_deduplicator: &mut ReusableDeduplicator<str>,
 ) -> Result<(), serde_json::Error> {
     let mut obj = JsonMap::new();
 
@@ -60,10 +62,11 @@ pub(super) fn encode_series_metric(
     }
     obj.insert("points".into(), JsonValue::Array(points));
 
-    let deduplicated = get_deduplicated_tags(metric, additional_tags, tags_deduplicator);
+    let deduplicated = tags_deduplicator.deduplicated(metric_tag_strings(metric, additional_tags));
     let mut tags_out = Vec::new();
     let mut device: Option<String> = None;
-    for tag in deduplicated {
+    for text in deduplicated {
+        let tag = BorrowedTag::from(text);
         if tag.name() == "dd.internal.resource" {
             continue;
         }
@@ -73,7 +76,7 @@ pub(super) fn encode_series_metric(
                 continue;
             }
         }
-        tags_out.push(JsonValue::String(tag.as_str().to_string()));
+        tags_out.push(JsonValue::String(text.to_string()));
     }
     obj.insert("tags".into(), JsonValue::Array(tags_out));
 
@@ -110,19 +113,6 @@ pub(super) fn encode_series_metric(
 #[inline]
 fn emittable(point: f64) -> bool {
     point.is_finite()
-}
-
-fn get_deduplicated_tags<'a>(
-    metric: &'a Metric, additional_tags: &'a SharedTagSet, tags_deduplicator: &'a mut ReusableDeduplicator<Tag>,
-) -> impl Iterator<Item = &'a Tag> {
-    let chained_tags = metric
-        .context()
-        .tags()
-        .into_iter()
-        .chain(additional_tags)
-        .chain(metric.context().origin_tags());
-
-    tags_deduplicator.deduplicated(chained_tags)
 }
 
 #[cfg(test)]
