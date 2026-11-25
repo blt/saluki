@@ -1,4 +1,4 @@
-use std::{collections::HashMap, collections::VecDeque, ops::Range, sync::Arc, time::Duration};
+use std::{any::Any, collections::HashMap, collections::VecDeque, ops::Range, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -1724,20 +1724,28 @@ fn write_metric_to_v3(
     let mut builder = writer.write_with_symbol_id(metric_type, name, hint);
 
     let mut promoted_tags = SmallVec::<[(&str, bool); 4]>::new();
-    let tags = context
-        .tags()
+    let context_tags = context.tags();
+    let tags = context_tags
         .strings_with_symbol_ids()
         .map(|(tag, hint)| (tag, hint, false))
         .chain(additional_tags.into_iter().map(|tag| (tag.as_str(), None, false)))
         .chain(context.origin_tags().into_iter().map(|tag| (tag.as_str(), None, true)));
-    builder.set_unique_tags(tags.filter_map(|(tag, hint, is_origin)| {
+    let tags = tags.filter_map(|(tag, hint, is_origin)| {
         if !is_sketch && (tag.starts_with("device:") || tag.starts_with("dd.internal.resource:")) {
             promoted_tags.push((tag, is_origin));
             None
         } else {
             Some((tag, hint))
         }
-    }));
+    });
+    if context_tags.len() >= 32 {
+        let mut symbol_owner: Option<Arc<dyn Any + Send + Sync>> = None;
+        builder.set_unique_tags_with_symbols(tags, || {
+            Arc::clone(symbol_owner.get_or_insert_with(|| Arc::new(context.clone())))
+        });
+    } else {
+        builder.set_unique_tags(tags);
+    }
 
     let host = context.host().filter(|host| !host.is_empty());
     let mut resources = SmallVec::<[(&str, &str); 4]>::new();
