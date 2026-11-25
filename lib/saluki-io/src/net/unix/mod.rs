@@ -7,6 +7,7 @@ use std::{
 };
 
 use bytes::BufMut;
+use socket2::SockRef;
 use tokio::net::{UnixDatagram, UnixStream};
 use tracing::{debug, trace};
 
@@ -16,14 +17,10 @@ mod ancillary;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
-use self::linux::uds_recvmsg;
-#[cfg(target_os = "linux")]
 pub use self::linux::{enable_uds_socket_credentials, socket_reuseport_supported, uds_sendmsg_with_creds};
 
 #[cfg(not(target_os = "linux"))]
 mod non_linux;
-#[cfg(not(target_os = "linux"))]
-use self::non_linux::uds_recvmsg;
 #[cfg(not(target_os = "linux"))]
 pub use self::non_linux::{enable_uds_socket_credentials, socket_reuseport_supported};
 use super::addr::{ConnectionAddress, ProcessCredentialsError, ProcessIdentity};
@@ -109,17 +106,16 @@ pub(crate) fn unix_peer_identity(socket: &UnixStream) -> ProcessIdentity {
 ///
 /// If the underlying system call fails, an error is returned.
 pub async fn unix_recvmsg<B: BufMut>(socket: &mut UnixStream, buf: &mut B) -> io::Result<(usize, ConnectionAddress)> {
-    // TODO: We technically don't need to do this for SOCK_STREAM because we can do it once when the
-    // connection is accepted, and then just do "normal" reads after that. We do still need to do it
-    // for SOCK_DGRAM, though... so we might want to actually consider updating our `socket2` PR to
-    // include support for even setting SO_PASSCRED (or the OS-specific equivalent) to also include
-    // macOS and FreeBSD (*BSD, really) so that this also works correctly for all
-    // `cfg(unix)`-capable platforms.
+    unix_recvmsg_with_credential_check(socket, buf, || true).await
+}
 
-    // We manually call `recvmsg` on our domain socket as stdlib/`mio`/`tokio` don't yet expose a way to do out-of-band
-    // reads to get ancillary data such as the socket credentials used to shuttle origin detection information.
+pub(crate) async fn unix_recvmsg_with_credential_check<B: BufMut>(
+    socket: &UnixStream, buf: &mut B, mut needs_credentials: impl FnMut() -> bool,
+) -> io::Result<(usize, ConnectionAddress)> {
     socket
-        .async_io(tokio::io::Interest::READABLE, || uds_recvmsg(socket, buf))
+        .async_io(tokio::io::Interest::READABLE, || {
+            recvmsg_on_ready(socket, buf, &mut needs_credentials)
+        })
         .await
 }
 
@@ -134,9 +130,28 @@ pub async fn unix_recvmsg<B: BufMut>(socket: &mut UnixStream, buf: &mut B) -> io
 ///
 /// If the underlying system call fails, an error is returned.
 pub async fn unixgram_recvmsg<B: BufMut>(socket: &UnixDatagram, buf: &mut B) -> io::Result<(usize, ConnectionAddress)> {
-    // We manually call `recvmsg` on our domain socket as stdlib/`mio`/`tokio` don't yet expose a way to do out-of-band
-    // reads to get ancillary data such as the socket credentials used to shuttle origin detection information.
+    unixgram_recvmsg_with_credential_check(socket, buf, || true).await
+}
+
+pub(crate) async fn unixgram_recvmsg_with_credential_check<B: BufMut>(
+    socket: &UnixDatagram, buf: &mut B, mut needs_credentials: impl FnMut() -> bool,
+) -> io::Result<(usize, ConnectionAddress)> {
     socket
-        .async_io(tokio::io::Interest::READABLE, || uds_recvmsg(socket, buf))
+        .async_io(tokio::io::Interest::READABLE, || {
+            recvmsg_on_ready(socket, buf, &mut needs_credentials)
+        })
         .await
+}
+
+fn recvmsg_on_ready<'sock, S, B: BufMut>(
+    socket: &'sock S, buf: &mut B, _needs_credentials: &mut impl FnMut() -> bool,
+) -> io::Result<(usize, ConnectionAddress)>
+where
+    SockRef<'sock>: From<&'sock S>,
+{
+    #[cfg(target_os = "linux")]
+    let received = linux::uds_recvmsg(socket, buf, _needs_credentials());
+    #[cfg(not(target_os = "linux"))]
+    let received = non_linux::uds_recvmsg(socket, buf);
+    received
 }

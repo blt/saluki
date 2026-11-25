@@ -23,7 +23,7 @@ use super::addr::ConnectionAddress;
 #[cfg(windows)]
 use super::addr::ProcessIdentity;
 #[cfg(unix)]
-use super::unix::{unix_peer_identity, unix_recvmsg, unixgram_recvmsg};
+use super::unix::{unix_peer_identity, unix_recvmsg_with_credential_check, unixgram_recvmsg_with_credential_check};
 
 /// A connection-oriented socket.
 ///
@@ -44,11 +44,13 @@ pub enum Connection {
 }
 
 impl Connection {
-    async fn receive<B: BufMut>(&mut self, buf: &mut B) -> io::Result<(usize, ConnectionAddress)> {
+    async fn receive<B: BufMut>(
+        &mut self, buf: &mut B, _needs_credentials: impl FnMut() -> bool,
+    ) -> io::Result<(usize, ConnectionAddress)> {
         match self {
             Self::Tcp(inner, addr) => inner.read_buf(buf).await.map(|n| (n, (*addr).into())),
             #[cfg(unix)]
-            Self::Unix(inner) => unix_recvmsg(inner, buf).await,
+            Self::Unix(inner) => unix_recvmsg_with_credential_check(inner, buf, _needs_credentials).await,
             #[cfg(windows)]
             Self::NamedPipe(inner) => inner
                 .read_buf(buf)
@@ -171,11 +173,13 @@ enum Connectionless {
 }
 
 impl Connectionless {
-    async fn receive<B: BufMut>(&mut self, buf: &mut B) -> io::Result<(usize, ConnectionAddress)> {
+    async fn receive<B: BufMut>(
+        &mut self, buf: &mut B, _needs_credentials: impl FnMut() -> bool,
+    ) -> io::Result<(usize, ConnectionAddress)> {
         match self {
             Self::Udp(inner) => inner.recv_buf_from(buf).await.map(|(n, addr)| (n, addr.into())),
             #[cfg(unix)]
-            Self::Unixgram(inner) => unixgram_recvmsg(inner, buf).await,
+            Self::Unixgram(inner) => unixgram_recvmsg_with_credential_check(inner, buf, _needs_credentials).await,
         }
     }
 }
@@ -222,9 +226,27 @@ impl Stream {
     ///
     /// If the underlying system call fails, an error is returned.
     pub async fn receive<B: BufMut>(&mut self, buf: &mut B) -> io::Result<(usize, ConnectionAddress)> {
+        self.receive_with_credential_check(buf, || true).await
+    }
+
+    /// Receives data from the stream with an optional Linux Unix socket credential lookup.
+    ///
+    /// On Linux Unix sockets, calls `needs_credentials` after readiness, before each receive attempt.
+    /// If it returns `false`, the kernel discards ancillary data. The address reports
+    /// [`ProcessIdentity::Unavailable`][crate::net::ProcessIdentity::Unavailable].
+    /// Other sockets use the default receive behavior without calling the check.
+    ///
+    /// On success, returns the number of bytes read and the peer address.
+    ///
+    /// # Errors
+    ///
+    /// If the underlying system call fails, an error is returned.
+    pub async fn receive_with_credential_check<B: BufMut>(
+        &mut self, buf: &mut B, needs_credentials: impl FnMut() -> bool,
+    ) -> io::Result<(usize, ConnectionAddress)> {
         match &mut self.inner {
-            StreamInner::Connection { socket } => socket.receive(buf).await,
-            StreamInner::Connectionless { socket } => socket.receive(buf).await,
+            StreamInner::Connection { socket } => socket.receive(buf, needs_credentials).await,
+            StreamInner::Connectionless { socket } => socket.receive(buf, needs_credentials).await,
         }
     }
 
@@ -323,5 +345,79 @@ impl From<NamedPipeServer> for Stream {
                 socket: Connection::NamedPipe(stream),
             },
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use std::{
+        cell::Cell,
+        future::Future as _,
+        pin::pin,
+        task::{Context, Waker},
+    };
+
+    use bytes::BytesMut;
+    use tokio::{
+        io::AsyncWriteExt as _,
+        net::{UnixDatagram, UnixStream},
+    };
+
+    use super::Stream;
+    use crate::net::{unix::enable_uds_socket_credentials, ConnectionAddress, ProcessIdentity};
+
+    #[tokio::test]
+    async fn unix_datagram_checks_credentials_after_readiness() {
+        let (sender, receiver) = UnixDatagram::pair().unwrap();
+        enable_uds_socket_credentials(&receiver).unwrap();
+        let mut stream = Stream::from(receiver);
+        let mut buf = BytesMut::with_capacity(32);
+        let needs_credentials = Cell::new(false);
+
+        // Capture can start while the socket has no data and the first receive is already pending.
+        let (n, addr) = {
+            let mut receive = pin!(stream.receive_with_credential_check(&mut buf, || needs_credentials.get()));
+            assert!(receive
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending());
+            needs_credentials.set(true);
+            sender.send(b"payload").await.unwrap();
+            receive.await.unwrap()
+        };
+
+        assert_eq!(n, 7);
+        assert_eq!(&buf[..], b"payload");
+        assert_eq!(
+            addr.process_credentials().unwrap().pid,
+            std::process::id() as libc::pid_t
+        );
+    }
+
+    #[tokio::test]
+    async fn unix_stream_opt_out_preserves_payload_and_default_credentials() {
+        let (mut sender, receiver) = UnixStream::pair().unwrap();
+        enable_uds_socket_credentials(&receiver).unwrap();
+        let mut stream = Stream::from(receiver);
+        let mut buf = BytesMut::with_capacity(32);
+
+        sender.write_all(b"a").await.unwrap();
+        let (n, addr) = stream.receive_with_credential_check(&mut buf, || false).await.unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(&buf[..], b"a");
+        assert!(matches!(
+            addr,
+            ConnectionAddress::ProcessLike(ProcessIdentity::Unavailable)
+        ));
+
+        buf.clear();
+        sender.write_all(b"b").await.unwrap();
+        let (n, addr) = stream.receive(&mut buf).await.unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(&buf[..], b"b");
+        assert_eq!(
+            addr.process_credentials().unwrap().pid,
+            std::process::id() as libc::pid_t
+        );
     }
 }
