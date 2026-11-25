@@ -3,7 +3,7 @@ use std::{
     num::NonZeroUsize,
     sync::{
         atomic::{AtomicU32, Ordering::Relaxed},
-        Arc, RwLock, Weak,
+        Arc, RwLock,
     },
     time::{Duration, Instant},
 };
@@ -12,7 +12,7 @@ use hashbrown::HashTable;
 use saluki_common::{hash::NoopU64BuildHasher, sync::shutdown::ShutdownHandle};
 use tokio::{pin, select, time::sleep};
 
-use super::{Context, ContextInner, ContextKey};
+use super::{super::packed::WeakPacked, Context, ContextKey};
 use crate::{
     cache::Telemetry,
     runtime::{self, ScopeGuard},
@@ -225,7 +225,7 @@ impl Slot {
 
 struct LiveSlot {
     key: ContextKey,
-    context: Weak<ContextInner>,
+    context: WeakPacked,
 }
 
 struct Shard {
@@ -303,11 +303,11 @@ impl Shard {
         let hash = index_hash(slot.key);
         let entry = self.index.find_entry(hash, |&i| i == position as u32).unwrap();
         // Keep weak pointers only for contexts that another owner can still use.
-        if Arc::strong_count(&slot.context.inner) > 1 {
+        if slot.context.inner.strong_count() > 1 {
             let live_position = self.live.len() as u32 | LIVE_BIT;
             self.live.push(LiveSlot {
                 key: slot.key,
-                context: Arc::downgrade(&slot.context.inner),
+                context: slot.context.inner.downgrade(),
             });
             *entry.into_mut() = live_position;
         } else {
@@ -399,14 +399,14 @@ mod tests {
 
     fn insert(shard: &mut Shard, name: &str, now: u32) -> bool {
         let context = Context::from_parts(name, crate::data_model::tags::TagSet::default());
-        let key = context.inner.key;
+        let key = context.inner.key();
         shard.insert(key, index_hash(key), context, now)
     }
 
     fn get<'a>(shard: &'a Shard, name: &str) -> Option<&'a Slot> {
         let key = Context::from_parts(name, crate::data_model::tags::TagSet::default())
             .inner
-            .key;
+            .key();
         shard.get(key, index_hash(key))
     }
 
@@ -479,14 +479,14 @@ mod tests {
         resolver.resolve("metric.b", ["env:prod"], None).unwrap();
 
         let cache = resolver.context_cache.as_ref().unwrap();
-        let key = held.inner.key;
+        let key = held.inner.key();
         assert!(cache.state.shards[0]
             .0
             .read()
             .unwrap()
             .get(key, index_hash(key))
             .is_none());
-        assert_eq!(Arc::strong_count(&held.inner), 1);
+        assert_eq!(held.inner.strong_count(), 1);
 
         let resolved = resolver.resolve("metric.a", ["env:prod"], None).unwrap();
         assert!(held.ptr_eq(&resolved));
@@ -507,7 +507,7 @@ mod tests {
             assert_eq!(shard.slots.capacity(), 0);
             assert_eq!(shard.index.len(), 1);
         }
-        assert_eq!(Arc::strong_count(&held.inner), 1);
+        assert_eq!(held.inner.strong_count(), 1);
 
         let resolved = resolver.resolve("metric.a", ["env:prod"], None).unwrap();
         assert!(held.ptr_eq(&resolved));

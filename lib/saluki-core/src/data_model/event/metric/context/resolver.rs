@@ -3,8 +3,9 @@ use std::{num::NonZeroUsize, sync::Arc, time::Duration};
 use saluki_common::{collections::PrehashedHashSet, hash::NoopU64BuildHasher, sync::shutdown::ShutdownHandle};
 use saluki_error::{generic_error, GenericError};
 use saluki_metrics::{static_metrics, Counter, Gauge};
+use smallvec::SmallVec;
 use stringtheory::{
-    interning::{GenericMapInterner, Interner as _},
+    interning::{GenericMapInterner, Interner as _, SymbolTable},
     CheapMetaString, MetaString,
 };
 use tokio::{pin, select, time::sleep};
@@ -12,13 +13,14 @@ use tracing::debug;
 
 use super::{
     hash::{hash_context_with_host_and_seen, ContextKey, TagSetKey},
-    Context, ContextInner,
+    packed::{Domain, Packed, Parts, StrictLease, TagMetadata, INLINE_TAG_CAPACITY},
+    Context,
 };
 use crate::{
     cache::{weight::ItemCountWeighter, Cache, CacheBuilder},
     data_model::{
         origin::{OriginTagsResolver, RawOrigin},
-        tags::{SharedTagSet, TagSet},
+        tags::{SharedTagSet, Tag, TagSet},
     },
     runtime::{self, ScopeGuard},
 };
@@ -66,6 +68,7 @@ pub struct ContextResolverBuilder {
     allow_heap_allocations: Option<bool>,
     tags_resolver: Option<TagsResolver>,
     interner: Option<GenericMapInterner>,
+    symbols: Option<Arc<SymbolTable>>,
     origin_tags_resolver: Option<Arc<dyn OriginTagsResolver>>,
     telemetry_enabled: bool,
 }
@@ -95,6 +98,7 @@ impl ContextResolverBuilder {
             allow_heap_allocations: None,
             tags_resolver: None,
             interner: None,
+            symbols: None,
             origin_tags_resolver: None,
             telemetry_enabled: true,
         })
@@ -210,11 +214,17 @@ impl ContextResolverBuilder {
         self
     }
 
-    /// Sets the interner to use for this resolver.
+    /// Sets the interner for resolvers that disallow heap fallback.
     ///
-    /// If an interner isn't provided, an interner will be created in [`ContextResolverBuilder::build`]
+    /// If absent, the builder creates it from the configured capacity.
     pub fn with_interner(mut self, interner: GenericMapInterner) -> Self {
         self.interner = Some(interner);
+        self
+    }
+
+    /// Shares the packed-context dictionary with another resolver in the same component.
+    pub fn with_symbol_table(mut self, symbols: Arc<SymbolTable>) -> Self {
+        self.symbols = Some(symbols);
         self
     }
 
@@ -258,9 +268,13 @@ impl ContextResolverBuilder {
         let allow_heap_allocations = self.allow_heap_allocations.unwrap_or(true);
 
         let telemetry = Telemetry::new(&self.name);
-        telemetry
-            .interner_capacity_bytes()
-            .set(interner.capacity_bytes() as f64);
+        let symbols = self
+            .symbols
+            .unwrap_or_else(|| Arc::new(SymbolTable::new(interner_capacity_bytes.get())));
+        let domain = Arc::new(Domain {
+            symbols,
+            active: telemetry.active_contexts().clone(),
+        });
 
         // The background tasks of this resolver run in a scope that the resolver owns. The caches that the resolver
         // builds start their own tasks inside that scope. Thus, all of these tasks appear below the resolver, and they
@@ -306,12 +320,19 @@ impl ContextResolverBuilder {
             Some(drivers) => drivers.enter_sync(build_caches),
             None => build_caches(),
         };
+        let use_packed_strings = allow_heap_allocations && tags_resolver.allow_heap_allocations;
+        let capacity = if use_packed_strings {
+            domain.symbols.capacity_bytes()
+        } else {
+            interner.capacity_bytes()
+        };
+        telemetry.interner_capacity_bytes().set(capacity as f64);
 
         if let (Some(drivers), true) = (drivers.as_mut(), self.telemetry_enabled) {
-            let (interner, telemetry) = (interner.clone(), telemetry.clone());
+            let (interner, telemetry, domain) = (interner.clone(), telemetry.clone(), Arc::clone(&domain));
             drivers.spawn(
                 runtime::worker_with_shutdown("telemetry", move |shutdown| {
-                    drive_telemetry(interner, telemetry, shutdown)
+                    drive_telemetry(interner, domain, use_packed_strings, telemetry, shutdown)
                 })
                 .build(),
             );
@@ -320,6 +341,8 @@ impl ContextResolverBuilder {
         ContextResolver {
             telemetry,
             interner,
+            domain,
+            use_packed_strings,
             context_cache,
             hash_seen_buffer: PrehashedHashSet::with_capacity_and_hasher(
                 SEEN_HASHSET_INITIAL_CAPACITY,
@@ -357,6 +380,8 @@ impl ContextResolverBuilder {
 pub struct ContextResolver {
     telemetry: Telemetry,
     interner: GenericMapInterner,
+    domain: Arc<Domain>,
+    use_packed_strings: bool,
     context_cache: Option<ContextCache>,
     hash_seen_buffer: PrehashedHashSet<u64>,
     allow_heap_allocations: bool,
@@ -413,31 +438,75 @@ impl ContextResolver {
         )
     }
 
-    fn create_context<N, H>(
-        &self, key: ContextKey, name: N, host: Option<H>, context_tags: SharedTagSet, origin_tags: SharedTagSet,
+    fn create_context<N, H, I, T>(
+        &self, keys: (ContextKey, TagSetKey), name: N, host: Option<H>, tags: I, origin: SharedTagSet,
     ) -> Option<Context>
     where
         N: AsRef<str> + CheapMetaString,
         H: AsRef<str> + CheapMetaString,
+        I: IntoIterator<Item = T>,
+        T: AsRef<str> + CheapMetaString,
     {
-        // Intern the name, host, and tags of the context.
-        let context_name = self.intern(name)?;
-        let context_host = match host {
-            Some(host) => Some(self.intern(host)?),
-            None => None,
+        let (key, tagset_key) = keys;
+        let origin = TagSet::from(origin);
+        let inner = if self.use_packed_strings {
+            // Packed contexts own their tags and bypass the tag-set cache.
+            let tags: SmallVec<[T; INLINE_TAG_CAPACITY]> = tags.into_iter().collect();
+            Packed::new(
+                Parts {
+                    key,
+                    name: name.as_ref(),
+                    host: host.as_ref().map(AsRef::as_ref),
+                    origin,
+                    domain: Some(&self.domain),
+                    tracked: true,
+                    metadata: TagMetadata {
+                        deduplicate: true,
+                        ..TagMetadata::default()
+                    },
+                    lease: None,
+                },
+                tags.iter().map(AsRef::as_ref),
+            )
+        } else {
+            let use_tagset_cache = self.context_cache.is_some();
+            let context_tags = if let Some(tag_set) = use_tagset_cache
+                .then(|| self.tags_resolver.get_tag_set(tagset_key))
+                .flatten()
+            {
+                self.telemetry.resolved_existing_tagset_total().increment(1);
+                tag_set
+            } else {
+                let tag_set = self.tags_resolver.create_tag_set(tags)?;
+                if use_tagset_cache {
+                    self.tags_resolver.insert_tag_set(tagset_key, &tag_set);
+                }
+                tag_set
+            };
+            let lease = Arc::new(StrictLease {
+                name: self.intern(name)?,
+                host: match host {
+                    Some(host) => Some(self.intern(host)?),
+                    None => None,
+                },
+                tags: context_tags,
+            });
+            Packed::new(
+                Parts {
+                    key,
+                    name: lease.name.as_ref(),
+                    host: lease.host.as_deref(),
+                    origin,
+                    domain: Some(&self.domain),
+                    tracked: true,
+                    metadata: TagMetadata::default(),
+                    lease: Some(&lease),
+                },
+                (&lease.tags).into_iter().map(Tag::as_str),
+            )
         };
-
         self.telemetry.resolved_new_context_total().increment(1);
-        self.telemetry.active_contexts().increment(1);
-
-        Some(Context::from_inner(ContextInner::from_parts(
-            key,
-            context_name,
-            context_host,
-            context_tags.into(),
-            origin_tags.into(),
-            self.telemetry.active_contexts().clone(),
-        )))
+        Some(Context { inner })
     }
 
     /// Resolves the given context.
@@ -565,27 +634,16 @@ impl ContextResolver {
     {
         let (context_key, tagset_key) =
             self.create_context_key_with_host(&name, host.as_ref(), tags.clone(), &origin_tags);
+        let create = || self.create_context((context_key, tagset_key), name, host, tags, origin_tags);
 
         let Some(cache) = &self.context_cache else {
-            let tag_set = self.tags_resolver.create_tag_set(tags)?;
-
-            let context = self.create_context(context_key, name, host, tag_set, origin_tags)?;
+            let context = create()?;
 
             debug!(?context_key, ?context, "Resolved new non-cached context.");
             return Some(context);
         };
 
-        let (context, existing) = cache.get_or_insert_with(context_key, || {
-            let tag_set = if let Some(tag_set) = self.tags_resolver.get_tag_set(tagset_key) {
-                self.telemetry.resolved_existing_tagset_total().increment(1);
-                tag_set
-            } else {
-                let tag_set = self.tags_resolver.create_tag_set(tags)?;
-                self.tags_resolver.insert_tag_set(tagset_key, &tag_set);
-                tag_set
-            };
-            self.create_context(context_key, name, host, tag_set, origin_tags)
-        })?;
+        let (context, existing) = cache.get_or_insert_with(context_key, create)?;
         if existing {
             self.telemetry.resolved_existing_context_total().increment(1);
         } else {
@@ -600,6 +658,8 @@ impl Clone for ContextResolver {
         Self {
             telemetry: self.telemetry.clone(),
             interner: self.interner.clone(),
+            domain: Arc::clone(&self.domain),
+            use_packed_strings: self.use_packed_strings,
             context_cache: self.context_cache.clone(),
             hash_seen_buffer: PrehashedHashSet::with_capacity_and_hasher(
                 SEEN_HASHSET_INITIAL_CAPACITY,
@@ -612,7 +672,10 @@ impl Clone for ContextResolver {
     }
 }
 
-async fn drive_telemetry(interner: GenericMapInterner, telemetry: Telemetry, shutdown: ShutdownHandle) {
+async fn drive_telemetry(
+    interner: GenericMapInterner, domain: Arc<Domain>, use_packed_strings: bool, telemetry: Telemetry,
+    shutdown: ShutdownHandle,
+) {
     pin!(shutdown);
 
     loop {
@@ -621,11 +684,13 @@ async fn drive_telemetry(interner: GenericMapInterner, telemetry: Telemetry, shu
             _ = sleep(Duration::from_secs(1)) => {}
         }
 
-        telemetry.interner_entries().set(interner.len() as f64);
-        telemetry
-            .interner_capacity_bytes()
-            .set(interner.capacity_bytes() as f64);
-        telemetry.interner_len_bytes().set(interner.len_bytes() as f64);
+        let (entries, len_bytes) = if use_packed_strings {
+            (domain.symbols.len(), domain.symbols.len_bytes())
+        } else {
+            (interner.len(), interner.len_bytes())
+        };
+        telemetry.interner_entries().set(entries as f64);
+        telemetry.interner_len_bytes().set(len_bytes as f64);
     }
 }
 
@@ -1389,6 +1454,27 @@ mod tests {
             let context = resolver.resolve("metric", ["env:prod"], None).unwrap();
             assert!(context.tags().has_tag("env:prod"));
         }
+    }
+
+    #[test]
+    fn strict_rewrite_releases_replaced_name() {
+        let mut resolver = ContextResolverBuilder::for_tests()
+            .with_interner_capacity_bytes(NonZeroUsize::new(48).unwrap())
+            .with_heap_allocations(false)
+            .without_caching()
+            .build();
+        let initial = resolver
+            .resolve("metric.strict.extra-long.name-a", ["tag"], None)
+            .unwrap();
+        assert!(resolver
+            .resolve("metric.strict.extra-long.name-b", ["tag"], None)
+            .is_none());
+        let rewritten = initial.with_name("renamed");
+        drop(initial);
+        assert!(resolver
+            .resolve("metric.strict.extra-long.name-b", ["tag"], None)
+            .is_some());
+        assert_eq!(rewritten.name(), "renamed");
     }
 
     #[test]
