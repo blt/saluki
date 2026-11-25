@@ -896,6 +896,18 @@ impl AggregationState {
     }
 
     fn close_slot(&mut self, cursor: &mut FlushCursor, slot: Slot) -> (bool, Option<Metric>) {
+        if let Some((timestamp, value)) = self.contexts.single_packed_gauge(slot) {
+            if timestamp > cursor.split_timestamp {
+                cursor.retained += 1;
+                return (true, None);
+            }
+            let values = MetricValues::gauge((timestamp, value));
+            self.telemetry.increment_flushed(&values, &mut cursor.counts);
+            let metadata = self.contexts.metadata(slot);
+            let context = self.remove_flushed_slot(slot);
+            return (false, Some(Metric::from_parts(context, values, metadata)));
+        }
+
         let mut values = self.contexts.take_values(slot);
         let last_seen = self.contexts.last_seen(slot);
         let expire_if_empty = if slot.kind() == AggregateMetricType::Counter {
@@ -931,15 +943,20 @@ impl AggregationState {
                 Metric::from_parts(self.contexts.header(slot).context.clone(), values, metadata)
             })
         } else {
-            let header = self.contexts.remove(slot);
-            self.telemetry
-                .decrement_contexts(&header.context, slot.kind(), header.origin_id);
-            if self.contexts.len() < self.context_limit {
-                self.context_limit_breached = false;
-            }
-            closed.map(|(values, metadata)| Metric::from_parts(header.context, values, metadata))
+            let context = self.remove_flushed_slot(slot);
+            closed.map(|(values, metadata)| Metric::from_parts(context, values, metadata))
         };
         (retained, metric)
+    }
+
+    fn remove_flushed_slot(&mut self, slot: Slot) -> Context {
+        let header = self.contexts.remove(slot);
+        self.telemetry
+            .decrement_contexts(&header.context, slot.kind(), header.origin_id);
+        if self.contexts.len() < self.context_limit {
+            self.context_limit_breached = false;
+        }
+        header.context
     }
 
     fn finish_flush(&mut self, cursor: FlushCursor) {

@@ -834,6 +834,18 @@ impl Storage {
         }
     }
 
+    pub(super) fn single_packed_gauge(&self, slot: Slot) -> Option<(u64, f64)> {
+        if slot.kind() != Kind::Gauge {
+            return None;
+        }
+        let row = self.rows.gauge.get(slot.index());
+        if row.header.flags != 1 {
+            return None;
+        }
+        let epoch = self.epoch.expect("a live row has an epoch");
+        Some((epoch + u64::from(row.payload.timestamps[0]), row.payload.values[0]))
+    }
+
     pub(super) fn take_values(&mut self, slot: Slot) -> MetricValues {
         let flags = mem::take(&mut self.rows.header_mut(slot).flags);
         if flags & FALLBACK != 0 {

@@ -312,6 +312,17 @@ fn raw_metric_values(input: &[u8]) -> IResult<&[u8], (MetricType, &[u8])> {
 fn metric_values_from_raw(
     input: &str, metric_type: MetricType, sample_rate: Option<SampleRate>, skip_empty_values: bool,
 ) -> Result<(u64, MetricValues), NomParserError<'_>> {
+    if matches!(metric_type, MetricType::Count | MetricType::Gauge) {
+        if let Some(value) = simple_metric_float(input.as_bytes()) {
+            let values = if matches!(metric_type, MetricType::Gauge) {
+                MetricValues::gauge(value)
+            } else {
+                MetricValues::counter(sample_rate.map_or(value, |rate| value * rate.raw_weight()))
+            };
+            return Ok((1, values));
+        }
+    }
+
     let mut num_points = 0;
     let floats = FloatIter::new(input, skip_empty_values).inspect(|_| num_points += 1);
 
