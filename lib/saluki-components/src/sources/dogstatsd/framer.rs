@@ -227,7 +227,7 @@ mod tests {
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
     use bytes::{Buf as _, BufMut as _};
-    use saluki_core::pooling::helpers::get_pooled_object_via_builder;
+    use saluki_core::pooling::{helpers::get_pooled_object_via_builder, ObjectPool as _};
     use saluki_io::{
         buf::{BytesBuffer, FixedSizeVec},
         deser::framing::FramingError,
@@ -235,6 +235,7 @@ mod tests {
     };
 
     use super::{get_framer, DsdFramer, Frame, Mode};
+    use crate::sources::dogstatsd::build_io_buffer_pool;
 
     const CAPACITY: usize = 8196;
 
@@ -320,6 +321,23 @@ mod tests {
 
     const fn missing_newline(frame_len: usize) -> Got {
         Got::Error(super::missing_newline(frame_len))
+    }
+
+    #[tokio::test]
+    async fn stream_decodes_maximum_frame_from_pooled_buffer() {
+        let (pool, _shrinker) = build_io_buffer_pool(2, 2, 8192);
+        let mut buf = pool.acquire().await;
+        let mut payload = [b'a'; 8192];
+        payload[8191] = b'\n';
+        assert_eq!(buf.remaining_mut(), CAPACITY);
+        buf.put_u32_le(8192);
+        buf.put_slice(&payload);
+        assert_eq!(buf.remaining_mut(), 0);
+        assert_eq!(
+            drain_all(nested(true), &mut buf, false, true),
+            [outer(&payload), Got::Completed(1), message(&payload[..8191])]
+        );
+        assert_eq!(buf.remaining(), 0);
     }
 
     #[test]

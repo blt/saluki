@@ -5,6 +5,8 @@ use bytes::{Buf, BufMut, Bytes};
 mod cursor;
 pub use self::cursor::ReadCursor;
 
+mod slab;
+
 mod vec;
 pub use self::vec::{BytesBuffer, FixedSizeVec};
 
