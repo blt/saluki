@@ -60,6 +60,7 @@ fn main() -> Result<(), GenericError> {
     // Register who we are before anything else, so that everything from here on -- including code that runs before
     // bootstrap -- reports this application rather than an unknown one.
     saluki_metadata::set_app_details(APP_DETAILS);
+    ALLOC.install_component_backend();
 
     #[cfg(feature = "antithesis")]
     initialize_antithesis();
@@ -267,6 +268,77 @@ mod tests {
     use metrics::Level;
 
     use super::parse_metrics_level;
+
+    #[cfg(all(any(target_os = "linux", target_os = "aix"), not(system_allocator)))]
+    #[test]
+    fn component_allocations_keep_the_smaller_jemalloc_size_class() {
+        use std::alloc::{GlobalAlloc, Layout};
+
+        use saluki_common::resource_tracking::{ComponentAllocator, ResourceGroupToken};
+
+        super::ALLOC.install_component_backend();
+        let direct = ComponentAllocator::new(ResourceGroupToken::root()).unwrap();
+        for (bytes, with_trailer) in [(64, 80), (160, 192)] {
+            let layout = Layout::from_size_align(bytes, 8).unwrap();
+            // SAFETY: Both pointers are allocated by jemalloc and freed with their original allocator and layout.
+            let (direct_bytes, tracked_bytes) = unsafe {
+                let direct_ptr = direct.alloc(layout);
+                let tracked_ptr = super::ALLOC.alloc(layout);
+                assert!(!direct_ptr.is_null() && !tracked_ptr.is_null());
+                let sizes = (
+                    tikv_jemallocator::usable_size(direct_ptr),
+                    tikv_jemallocator::usable_size(tracked_ptr),
+                );
+                direct.dealloc(direct_ptr, layout);
+                super::ALLOC.dealloc(tracked_ptr, layout);
+                sizes
+            };
+            assert_eq!((direct_bytes, tracked_bytes), (bytes, with_trailer));
+        }
+    }
+
+    #[test]
+    fn packed_allocation_is_charged_to_the_resolver_group() {
+        use saluki_common::resource_tracking::{ResourceGroupRegistry, ResourceStatsSnapshot};
+        use saluki_core::data_model::event::metric::context::ContextResolverBuilder;
+
+        super::ALLOC.install_component_backend();
+        let registry = ResourceGroupRegistry::global();
+        let group = "packed-context-tests/direct-allocation";
+        let token = registry.register_resource_group(group);
+        let mut resolver = {
+            let _guard = token.enter();
+            ContextResolverBuilder::for_tests().without_caching().build()
+        };
+        let snapshot = || {
+            let mut group_stats = None;
+            registry.visit_resource_groups(|name, stats| {
+                if name == group {
+                    group_stats = Some(stats.snapshot_delta(&ResourceStatsSnapshot::empty()));
+                }
+            });
+            group_stats.unwrap()
+        };
+        let before = snapshot();
+        let context = resolver.resolve("m", ["a:b"], None).unwrap();
+        let packed = 64;
+        let live = snapshot();
+        assert_eq!(live.allocated_bytes - before.allocated_bytes, packed);
+        assert_eq!(live.allocated_objects - before.allocated_objects, 1);
+        assert_eq!(live.deallocated_bytes, before.deallocated_bytes);
+
+        drop(context);
+        let released = snapshot();
+        assert_eq!(released.deallocated_bytes - live.deallocated_bytes, packed);
+        assert_eq!(released.deallocated_objects - live.deallocated_objects, 1);
+
+        let survivor = resolver.resolve("n", ["a:b"], None).unwrap();
+        drop(resolver);
+        let before_drop = snapshot();
+        drop(survivor);
+        // The final context also keeps the resolver domain allocation live.
+        assert!(snapshot().deallocated_bytes - before_drop.deallocated_bytes >= packed);
+    }
 
     #[test]
     fn parse_metrics_level_accepts_only_a_known_level() {
