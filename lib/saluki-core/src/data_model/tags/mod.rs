@@ -116,6 +116,66 @@ impl CheapMetaString for Tag {
     }
 }
 
+/// A tag borrowed from a metric context.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct TagRef<'a>(&'a str);
+
+impl<'a> TagRef<'a> {
+    /// Returns the length of this tag in bytes.
+    pub fn len(self) -> usize {
+        self.0.len()
+    }
+
+    /// Returns whether this tag is empty.
+    pub fn is_empty(self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Returns the complete tag.
+    pub fn as_str(self) -> &'a str {
+        self.0
+    }
+
+    /// Returns the key, or the entire string for a bare tag.
+    pub fn name(self) -> &'a str {
+        self.as_borrowed().name()
+    }
+
+    /// Returns the value of a key/value tag, if any.
+    pub fn value(self) -> Option<&'a str> {
+        self.as_borrowed().value()
+    }
+
+    /// Returns a view that remembers the position of the key/value separator.
+    pub fn as_borrowed(self) -> BorrowedTag<'a> {
+        BorrowedTag::from(self.0)
+    }
+}
+
+impl<'a> From<&'a str> for TagRef<'a> {
+    fn from(value: &'a str) -> Self {
+        Self(value)
+    }
+}
+
+impl AsRef<str> for TagRef<'_> {
+    fn as_ref(&self) -> &str {
+        self.0
+    }
+}
+
+impl CheapMetaString for TagRef<'_> {
+    fn try_cheap_clone(&self) -> Option<MetaString> {
+        MetaString::try_inline(self.0)
+    }
+}
+
+impl fmt::Display for TagRef<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 /// A borrowed metric tag.
 #[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct BorrowedTag<'a> {
