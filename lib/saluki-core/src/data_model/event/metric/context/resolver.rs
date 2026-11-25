@@ -573,7 +573,7 @@ impl ContextResolver {
 
         // Fast path to avoid looking up the context in the cache if caching is disabled.
         if !self.caching_enabled {
-            let tag_set = self.tags_resolver.create_tag_set(tags).unwrap_or_default();
+            let tag_set = self.tags_resolver.create_tag_set(tags)?;
 
             let context = self.create_context(context_key, name, host, tag_set, origin_tags)?;
 
@@ -595,7 +595,7 @@ impl ContextResolver {
                     }
                     None => {
                         // If the tagset is not cached, we need to create it.
-                        let tag_set = self.tags_resolver.create_tag_set(tags.clone()).unwrap_or_default();
+                        let tag_set = self.tags_resolver.create_tag_set(tags.clone())?;
 
                         self.tags_resolver.insert_tag_set(tagset_key, tag_set.clone());
 
@@ -1376,6 +1376,25 @@ mod tests {
         // they're two distinct contexts in terms of not being cached:
         assert_eq!(context1, context2);
         assert!(!context1.ptr_eq(&context2));
+    }
+
+    #[test]
+    fn tag_interner_exhaustion_rejects_the_context() {
+        for context_cache_limit in [0, 1] {
+            let tags_resolver = TagsResolverBuilder::for_tests().with_heap_allocations(false).build();
+            let mut resolver = ContextResolverBuilder::for_tests()
+                .with_cached_contexts_limit(context_cache_limit)
+                .with_tags_resolver(Some(tags_resolver))
+                .with_heap_allocations(false)
+                .build();
+
+            let tags = ["env:prod", "service:more-than-23-bytes-long"];
+            for _ in 0..2 {
+                assert!(resolver.resolve("metric", tags, None).is_none());
+            }
+            let context = resolver.resolve("metric", ["env:prod"], None).unwrap();
+            assert!(context.tags().has_tag("env:prod"));
+        }
     }
 
     #[test]
