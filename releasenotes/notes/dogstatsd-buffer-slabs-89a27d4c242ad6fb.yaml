@@ -1,0 +1,3 @@
+enhancements:
+  - |
+    Reduce memory overhead for DogStatsD receive buffers by sharing allocations.
