@@ -241,6 +241,10 @@ impl WorkloadProvider for RemoteAgentWorkloadProvider {
         }
     }
 
+    fn tag_generation(&self) -> Option<u64> {
+        self.tags_querier.tag_generation()
+    }
+
     fn get_self_container_tags(&self) -> Option<SharedTagSet> {
         let self_container_entity = self.on_demand_pid_resolver.resolve_self_container()?;
         self.tags_querier
