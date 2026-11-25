@@ -7,7 +7,6 @@ use std::{
 
 use async_trait::async_trait;
 use ddsketch::DDSketch;
-use hashbrown::{hash_map::Entry, HashMap};
 use saluki_common::time::get_unix_timestamp;
 use saluki_core::{
     accounting::{MemoryBounds, MemoryBoundsBuilder, UsageExpr},
@@ -31,7 +30,10 @@ use tokio::{
 use tracing::{debug, error, info, trace, warn};
 
 mod telemetry;
-use self::telemetry::{origin_telemetry_bytes, FlushCounts, OriginContextId, Telemetry};
+use self::telemetry::{origin_telemetry_bytes, FlushCounts, Telemetry};
+
+mod storage;
+use self::storage::{Slot, Storage, FIXED_ROW_BYTES, INDEX_BYTES_PER_ROW, PAGE_SLACK_BYTES};
 
 mod config;
 pub use self::config::HistogramConfiguration;
@@ -409,13 +411,7 @@ impl TransformBuilder for AggregateConfiguration {
 
 impl MemoryBounds for AggregateConfiguration {
     fn specify_bounds(&self, builder: &mut MemoryBoundsBuilder) {
-        // TODO: While we account for the aggregation state map accurately, what we don't currently account for is the
-        // fact that a metric could have multiple distinct values. For the common pipeline of metrics in via DogStatsD,
-        // this generally shouldn't be a problem because the values don't have a timestamp, so they get aggregated into
-        // the same bucket, leading to two values per `MetricValues` at most, which is already baked into the size of
-        // `MetricValues` due to using `SmallVec`.
-        //
-        // However, there could be many more values in a single metric, and we don't account for that.
+        // The estimate covers dense rows and the index, not variable-sized metric payloads or uncommon metadata.
 
         builder
             .minimum()
@@ -423,14 +419,10 @@ impl MemoryBounds for AggregateConfiguration {
             .with_single_value::<Aggregate>("component struct");
         builder
             .firm()
-            // Account for the aggregation state map, where we map contexts to the merged metric.
+            .with_fixed_amount("partially filled and spare aggregation pages", PAGE_SLACK_BYTES)
             .with_expr(UsageExpr::product(
-                "aggregation state map",
-                UsageExpr::sum(
-                    "context map entry",
-                    UsageExpr::struct_size::<Context>("context"),
-                    UsageExpr::struct_size::<AggregatedMetric>("aggregated metric"),
-                ),
+                "aggregation storage",
+                UsageExpr::constant("dense row and index slot", FIXED_ROW_BYTES + INDEX_BYTES_PER_ROW),
                 UsageExpr::config("aggregate_context_limit", self.context_limit),
             ))
             // A snapshot is constructed while the aggregation state remains live, so its peak allocation is additive.
@@ -588,30 +580,8 @@ async fn receive_context_snapshot_request(
     }
 }
 
-#[derive(Clone)]
-struct AggregatedMetric {
-    values: MetricValues,
-    metadata: MetricMetadata,
-    last_seen: u64,
-    origin_id: OriginContextId,
-}
-
-impl AggregatedMetric {
-    fn merge(&mut self, timestamp: u64, values: MetricValues, metadata: MetricMetadata) {
-        // Other metadata changes within a flush interval are ignored to keep things simple.
-        self.last_seen = timestamp;
-        self.values.merge(values);
-
-        // The first non-empty unit wins and persists until the entry is removed; non-counters are removed once all
-        // values are flushed, so a stale unit outlives its samples by at most one flush.
-        if self.metadata.unit.is_empty() {
-            self.metadata.unit = metadata.unit;
-        }
-    }
-}
-
 struct AggregationState {
-    contexts: HashMap<Context, AggregatedMetric, foldhash::quality::RandomState>,
+    contexts: Storage,
     contexts_remove_buf: Vec<Context>,
     context_limit: usize,
     bucket_width_secs: NonZeroU64,
@@ -632,7 +602,7 @@ impl AggregationState {
         let counter_expire_secs = counter_expiration.map(|d| d.as_secs()).and_then(NonZeroU64::new);
 
         Self {
-            contexts: HashMap::default(),
+            contexts: Storage::default(),
             contexts_remove_buf: Vec::new(),
             context_limit,
             bucket_width_secs,
@@ -650,18 +620,20 @@ impl AggregationState {
 
     fn snapshot_contexts(&self) -> Vec<AggregateContextSnapshotEntry> {
         let mut snapshot = Vec::with_capacity(self.contexts.len());
-        for (context, aggregated) in &self.contexts {
-            snapshot.push(AggregateContextSnapshotEntry {
-                context: context.clone(),
-                metric_type: AggregateMetricType::from(&aggregated.values),
-            });
+        for metric_type in AggregateMetricType::ALL {
+            for i in 0..self.contexts.len_for(metric_type) {
+                snapshot.push(AggregateContextSnapshotEntry {
+                    context: self.contexts.header(Slot::new(metric_type, i)).context.clone(),
+                    metric_type,
+                });
+            }
         }
         snapshot
     }
 
     fn insert(&mut self, timestamp: u64, metric: Metric) -> bool {
-        // If we haven't seen this context yet, and it would put us over the limit to insert it, then return early.
-        if !self.contexts.contains_key(metric.context()) && self.contexts.len() >= self.context_limit {
+        let slot = self.contexts.find(metric.context());
+        if slot.is_none() && self.contexts.len() >= self.context_limit {
             self.context_limit_breached = true;
             return false;
         }
@@ -688,27 +660,22 @@ impl AggregationState {
             "Inserting metric into aggregation state."
         );
 
-        // If we're already tracking this context, update the last seen time and merge the new values into the existing
-        // values. Otherwise, create a new entry.
-        match self.contexts.entry(context) {
-            Entry::Occupied(mut entry) => entry.get_mut().merge(timestamp, values, metadata),
-            Entry::Vacant(entry) => {
-                let origin_id = self.telemetry.increment_contexts(entry.key(), &values);
-
-                entry.insert(AggregatedMetric {
-                    values,
-                    metadata,
-                    last_seen: timestamp,
-                    origin_id,
-                });
-
-                saluki_antithesis::always_le!(
-                    self.contexts.len(),
-                    self.context_limit,
-                    "aggregate context map within context_limit",
-                    { "len": self.contexts.len(), "limit": self.context_limit }
-                );
+        let kind = AggregateMetricType::from(&values);
+        if let Some(slot) = slot {
+            if slot.kind() != kind {
+                self.telemetry
+                    .change_context_type(&self.contexts.header(slot).context, slot.kind(), kind);
             }
+            self.contexts.update(slot, values, metadata, timestamp);
+        } else {
+            let origin_id = self.telemetry.increment_contexts(&context, kind);
+            self.contexts.insert(context, values, metadata, timestamp, origin_id);
+            saluki_antithesis::always_le!(
+                self.contexts.len(),
+                self.context_limit,
+                "aggregate context map within context_limit",
+                { "len": self.contexts.len(), "limit": self.context_limit }
+            );
         }
 
         true
@@ -781,7 +748,15 @@ impl AggregationState {
 
         let mut flush_counts = FlushCounts::default();
 
-        for (context, am) in self.contexts.iter_mut() {
+        let kinds = AggregateMetricType::ALL;
+        let frontiers = kinds.map(|kind| self.contexts.len_for(kind));
+        let slots = kinds
+            .into_iter()
+            .zip(frontiers)
+            .flat_map(|(kind, len)| (0..len).map(move |i| Slot::new(kind, i)));
+        for slot in slots {
+            let mut values = self.contexts.take_values(slot);
+            let last_seen = self.contexts.last_seen(slot);
             // Figure out if we should remove this metric or not if it has no values in open buckets.
             //
             // We have a special carve-out for counters here, which we have the ability to keep alive after they are
@@ -790,15 +765,15 @@ impl AggregationState {
             // not.
             //
             // This is useful for sparsely-updated counters.
-            let should_expire_if_empty = match &am.values {
-                MetricValues::Counter(..) => {
+            let should_expire_if_empty = match slot.kind() {
+                AggregateMetricType::Counter => {
                     saluki_antithesis::always_le!(
-                        am.last_seen,
+                        last_seen,
                         u64::MAX - counter_expire_secs,
                         "aggregate counter expiry add does not overflow",
-                        { "last_seen": am.last_seen, "counter_expire_secs": counter_expire_secs }
+                        { "last_seen": last_seen, "counter_expire_secs": counter_expire_secs }
                     );
-                    counter_expire_secs == 0 || am.last_seen.saturating_add(counter_expire_secs) < current_time
+                    counter_expire_secs == 0 || last_seen.saturating_add(counter_expire_secs) < current_time
                 }
                 _ => true,
             };
@@ -808,11 +783,11 @@ impl AggregationState {
             //
             // This is also safe to do even when there are real values in those buckets since adding zero to anything is
             // a no-op from the perspective of what we end up flushing, and it doesn't mess with the "last seen" time.
-            if let MetricValues::Counter(..) = &mut am.values {
-                let expires_at = am.last_seen.saturating_add(counter_expire_secs);
+            if slot.kind() == AggregateMetricType::Counter {
+                let expires_at = last_seen.saturating_add(counter_expire_secs);
                 for (zv_bucket_start, zero_value) in &zero_value_buckets {
                     if expires_at > *zv_bucket_start {
-                        am.values.merge(zero_value.clone());
+                        values.merge(zero_value.clone());
                     } else {
                         // Since zero-value buckets are in order, we can break early if this bucket is past the
                         // expiration cutoff of the counter. No other bucket will be within the expiration range.
@@ -829,15 +804,18 @@ impl AggregationState {
             //
             // This means we'll always remove all-closed/empty non-counter metrics, and we _may_ remove all-closed/empty
             // counters.
-            if let Some(closed_bucket_values) = am.values.split_at_timestamp(split_timestamp) {
+            let closed = values.split_at_timestamp(split_timestamp);
+            let should_remove = values.is_empty() && should_expire_if_empty;
+            self.contexts.set_values(slot, values, last_seen);
+            if let Some(closed_bucket_values) = closed {
                 self.telemetry
                     .increment_flushed(&closed_bucket_values, &mut flush_counts);
 
                 // We got some closed bucket values, so flush those out.
                 transform_and_push_metric(
-                    context.clone(),
+                    self.contexts.header(slot).context.clone(),
                     closed_bucket_values,
-                    am.metadata.clone(),
+                    self.contexts.metadata(slot),
                     bucket_width_secs,
                     &self.hist_config,
                     dispatcher,
@@ -845,23 +823,21 @@ impl AggregationState {
                 .await?;
             }
 
-            if am.values.is_empty() && should_expire_if_empty {
-                self.contexts_remove_buf.push(context.clone());
+            if should_remove {
+                self.contexts_remove_buf
+                    .push(self.contexts.header(slot).context.clone());
             }
         }
 
         // Remove any contexts that were marked as needing to be removed.
-        let contexts_len_before = self.contexts.len();
         for context in self.contexts_remove_buf.drain(..) {
-            if let Some(am) = self.contexts.remove(&context) {
-                self.telemetry.decrement_contexts(&context, &am.values, am.origin_id);
+            if let Some(slot) = self.contexts.find(&context) {
+                let header = self.contexts.remove(slot);
+                self.telemetry
+                    .decrement_contexts(&header.context, slot.kind(), header.origin_id);
             }
         }
-        let contexts_len_after = self.contexts.len();
-
-        let contexts_delta = contexts_len_before.saturating_sub(contexts_len_after);
-        let target_contexts_capacity = contexts_len_after.saturating_add(contexts_delta / 2);
-        self.contexts.shrink_to(target_contexts_capacity);
+        self.contexts.trim_empty_side_stores();
 
         if self.context_limit_breached && self.contexts.len() < self.context_limit {
             self.context_limit_breached = false;
@@ -974,25 +950,7 @@ const fn align_to_bucket_start(timestamp: u64, bucket_width_secs: NonZeroU64) ->
 const fn is_bucket_closed(
     current_time: u64, bucket_start: u64, bucket_width_secs: NonZeroU64, flush_open_buckets: bool,
 ) -> bool {
-    // A bucket is considered "closed" if the current time is greater than the end of the bucket, or if
-    // `flush_open_buckets` is `true`.
-    //
-    // Buckets represent a half-open interval, where the start is inclusive and the end is exclusive. This means that
-    // for a bucket start of 10, and a width of 10, the bucket is 10 seconds "wide", and its start and end are 10 and
-    // 20, with the 20 excluded, or [10, 20) in interval notation. Simply put, if we have a timestamp of 10, or anything
-    // smaller than 20, we would consider it to fall within the bucket... but 20 or more would be outside of the bucket.
-    //
-    // We can also represent this visually:
-    //
-    // <--------- bucket 1 ----------> <--------- bucket 2 ----------> <--------- bucket 3 ---------->
-    // [10 11 12 13 14 15 16 17 18 19] [20 21 22 23 24 25 26 27 28 29] [30 31 32 33 34 35 36 37 38 39]
-    //
-    // We can see that each bucket is 10 seconds wide (10 elements, one for each second), and that their ends are
-    // effectively `start + width - 1`. This means that for any of these buckets to be considered "closed", the current
-    // time has to be _greater_ than `start + width - 1`. For example, if the current time is 19, then no buckets are
-    // closed, and if the current time is 29, then bucket 1 is closed but buckets 2 and 3 are still open, and if the
-    // current time is 30, then both buckets 1 and 2 are closed, but bucket 3 is still open.
-    (bucket_start + bucket_width_secs.get() - 1) < current_time || flush_open_buckets
+    flush_open_buckets || current_time.saturating_sub(bucket_start) >= bucket_width_secs.get()
 }
 
 // TODO: One thing we ought to consider is a property test, specifically a state machine property test, where we
@@ -1433,7 +1391,7 @@ mod tests {
         let bounds = registry.as_bounds();
 
         let expected_minimum = size_of::<Aggregate>();
-        let aggregation_state_bytes = context_limit * (size_of::<Context>() + size_of::<AggregatedMetric>());
+        let aggregation_state_bytes = context_limit * (FIXED_ROW_BYTES + INDEX_BYTES_PER_ROW) + PAGE_SLACK_BYTES;
         let context_snapshot_bytes = context_limit * size_of::<AggregateContextSnapshotEntry>();
 
         assert_eq!(bounds.total_minimum_required_bytes(), expected_minimum);
@@ -2192,8 +2150,9 @@ mod tests {
         let second_context =
             Context::from_static_parts("metric.two", &[]).with_origin_tags(same_origin_different_order);
 
-        let first_id = telemetry.increment_contexts(&first_context, &values);
-        let second_id = telemetry.increment_contexts(&second_context, &values);
+        let kind = AggregateMetricType::from(&values);
+        let first_id = telemetry.increment_contexts(&first_context, kind);
+        let second_id = telemetry.increment_contexts(&second_context, kind);
         assert_eq!(
             recorder.gauge((
                 "aggregate_active_contexts_by_origin",
@@ -2202,7 +2161,7 @@ mod tests {
             Some(2.0)
         );
 
-        telemetry.decrement_contexts(&first_context, &values, first_id);
+        telemetry.decrement_contexts(&first_context, kind, first_id);
         assert_eq!(
             recorder.gauge((
                 "aggregate_active_contexts_by_origin",
@@ -2210,7 +2169,7 @@ mod tests {
             )),
             Some(1.0)
         );
-        telemetry.decrement_contexts(&second_context, &values, second_id);
+        telemetry.decrement_contexts(&second_context, kind, second_id);
         assert_eq!(
             recorder.gauge((
                 "aggregate_active_contexts_by_origin",
@@ -2220,7 +2179,7 @@ mod tests {
         );
 
         let unresolved_context = Context::from_static_parts("metric.unresolved", &[]);
-        telemetry.increment_contexts(&unresolved_context, &values);
+        telemetry.increment_contexts(&unresolved_context, kind);
         assert_eq!(recorder.gauge("aggregate_active_contexts_by_origin"), None);
     }
 
@@ -2262,7 +2221,7 @@ mod tests {
         assert!(state.insert(future_ts, Metric::gauge(revived.clone(), (future_ts, 1.0))));
         let _ = get_flushed_metrics_with_open_windows(flush_ts(1), false, &mut state).await;
         assert_eq!(state.contexts.len(), 1);
-        assert!(state.contexts.contains_key(&revived));
+        assert!(state.contexts.find(&revived).is_some());
         assert_eq!(recorder.gauge(metric), Some(1.0));
         let _ = get_flushed_metrics_with_open_windows(future_ts + 100, false, &mut state).await;
         assert!(state.contexts.is_empty());
