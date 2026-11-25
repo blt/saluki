@@ -91,9 +91,66 @@ impl Interner {
     }
 }
 
+/// Avoids hashing the small, repeating resource and origin dictionaries common in a payload.
+#[derive(Debug)]
+pub(crate) struct RecentInterner<const N: usize> {
+    interner: Interner,
+    recent: [Option<Record>; N],
+    next: usize,
+}
+
+impl<const N: usize> Default for RecentInterner<N> {
+    fn default() -> Self {
+        Self {
+            interner: Interner::default(),
+            recent: [None; N],
+            next: 0,
+        }
+    }
+}
+
+impl<const N: usize> RecentInterner<N> {
+    pub fn get_or_insert<T: Copy + Eq + Hash>(
+        &mut self, key: &[T], arena: &mut Vec<T>, prefix: impl FnOnce(&mut Vec<T>),
+    ) -> (i64, bool) {
+        for record in self.recent.iter().flatten() {
+            if record.len == key.len() && arena[record.start..record.start + record.len] == *key {
+                return (record.id, false);
+            }
+        }
+        let (record, is_new) = self.interner.intern(key, arena, prefix);
+        self.recent[self.next] = Some(record);
+        self.next = (self.next + 1) % N;
+        (record.id, is_new)
+    }
+
+    pub fn clear(&mut self) {
+        self.interner.clear();
+        self.recent.fill(None);
+        self.next = 0;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeated_keys_keep_dictionary_ids_after_leaving_recent_cache() {
+        let mut index = RecentInterner::<2>::default();
+        let mut arena = Vec::new();
+        for key in 1..=3 {
+            assert_eq!(index.get_or_insert(&[key], &mut arena, |_| {}), (key, true));
+        }
+        assert_eq!(index.get_or_insert(&[1], &mut arena, |_| {}), (1, false));
+        assert_eq!(index.get_or_insert(&[1], &mut arena, |_| {}), (1, false));
+        assert_eq!(arena, [1, 2, 3]);
+
+        index.clear();
+        arena.clear();
+        assert_eq!(index.get_or_insert(&[3], &mut arena, |_| {}), (1, true));
+        assert_eq!(arena, [3]);
+    }
 
     #[test]
     fn interns_exact_slices_across_growth_and_clear() {
