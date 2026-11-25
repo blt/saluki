@@ -3,21 +3,86 @@ use std::{
     collections::HashMap,
     future::Future,
     marker::PhantomData,
+    mem,
     pin::Pin,
-    ptr::NonNull,
+    ptr::{self, NonNull},
     sync::{Mutex, OnceLock},
     task::{Context, Poll},
 };
 
 use pin_project::pin_project;
 
-use super::stats::{thread_cpu_time_nanos, ResourceStats};
+use super::stats::{thread_cpu_time_nanos, AllocationCounts, ResourceStats};
 
 static REGISTRY: OnceLock<ResourceGroupRegistry> = OnceLock::new();
 static ROOT_GROUP: ResourceStats = ResourceStats::new();
 
 thread_local! {
-    pub(super) static CURRENT_GROUP: RefCell<NonNull<ResourceStats>> = RefCell::new(NonNull::from(&ROOT_GROUP));
+    static TRACKING: RefCell<ThreadTracking> = const { RefCell::new(ThreadTracking::new()) };
+}
+
+struct ThreadTracking {
+    group: Option<&'static ResourceStats>,
+    allocations: AllocationCounts,
+    cpu_time_start: Option<u64>,
+}
+
+impl ThreadTracking {
+    const fn new() -> Self {
+        Self {
+            group: None,
+            allocations: AllocationCounts::EMPTY,
+            cpu_time_start: None,
+        }
+    }
+
+    fn is_active(&self, group: &ResourceStats) -> bool {
+        self.group.is_some_and(|active| ptr::eq(active, group))
+    }
+
+    fn flush_allocations(&mut self) {
+        if let Some(group) = self.group {
+            group.publish_allocations(&mem::replace(&mut self.allocations, AllocationCounts::EMPTY));
+        }
+    }
+
+    fn switch_group(&mut self, next_group: Option<&'static ResourceStats>, now: Option<u64>) {
+        self.flush_allocations();
+        if let (Some(group), Some(start), Some(end)) = (self.group, self.cpu_time_start, now) {
+            group.track_cpu_time(end.saturating_sub(start));
+        }
+        self.group = next_group;
+        self.cpu_time_start = now;
+    }
+}
+
+/// Records counts for `owner`, or for the current group if the allocation has no owner yet.
+#[inline]
+pub(super) fn track_memory(owner: Option<&'static ResourceStats>, counts: AllocationCounts) -> &'static ResourceStats {
+    TRACKING
+        .try_with(|tracking| {
+            let mut tracking = tracking.borrow_mut();
+            if let Some(group) = tracking
+                .group
+                .filter(|group| owner.is_none_or(|owner| ptr::eq(owner, *group)))
+            {
+                if tracking.allocations.accumulate(&counts) {
+                    tracking.flush_allocations();
+                }
+                group
+            } else {
+                // A batch holds only the active group's counts. Publish foreign and unscoped counts directly.
+                let group = owner.unwrap_or(&ROOT_GROUP);
+                group.publish_allocations(&counts);
+                group
+            }
+        })
+        .unwrap_or_else(|_| {
+            // Allocations can occur during TLS teardown. The trailer owner remains valid.
+            let group = owner.unwrap_or(&ROOT_GROUP);
+            group.publish_allocations(&counts);
+            group
+        })
 }
 
 /// A token associated with a specific resource group.
@@ -36,10 +101,7 @@ impl ResourceGroupToken {
 
     /// Returns an `ResourceGroupToken` for the current resource group.
     pub fn current() -> Self {
-        CURRENT_GROUP.with(|current_group| {
-            let group_ptr = current_group.borrow();
-            Self::new(*group_ptr)
-        })
+        TRACKING.with(|tracking| Self::new(NonNull::from(tracking.borrow().group.unwrap_or(&ROOT_GROUP))))
     }
 
     pub(super) fn stats(&self) -> &'static ResourceStats {
@@ -59,18 +121,15 @@ impl ResourceGroupToken {
 
     /// Enters this resource group, returning a guard that will exit the resource group when dropped.
     pub fn enter(&self) -> ResourceTrackingGuard<'_> {
-        // Track our starting point for this thread's CPU usage.
-        let thread_cpu_usage_start = thread_cpu_time_nanos().unwrap_or(0);
-
-        // Swap the current group to the one we're tracking.
-        CURRENT_GROUP.with(|current_group| {
-            let mut group_ptr = current_group.borrow_mut();
-            let previous_group_ptr = *group_ptr;
-            *group_ptr = self.group_ptr;
-
+        TRACKING.with(|tracking| {
+            let mut tracking = tracking.borrow_mut();
+            let previous_group = tracking.group;
+            let group = self.stats();
+            if !tracking.is_active(group) {
+                tracking.switch_group(Some(group), thread_cpu_time_nanos());
+            }
             ResourceTrackingGuard {
-                previous_group_ptr,
-                thread_cpu_usage_start,
+                previous_group,
                 _token: PhantomData,
             }
         })
@@ -86,34 +145,24 @@ unsafe impl Sync for ResourceGroupToken {}
 
 /// A guard representing an resource group which has been entered.
 ///
-/// When the guard is dropped, the resource group will be exited and the previously entered resource group will be
-/// restored.
+/// Dropping the guard restores the previous group. Drop nested guards in reverse order.
+/// CPU time is attributed only to the innermost active group.
 ///
 /// This is returned by the [`ResourceGroupToken::enter`] method.
 pub struct ResourceTrackingGuard<'a> {
-    previous_group_ptr: NonNull<ResourceStats>,
-    thread_cpu_usage_start: u64,
-    _token: PhantomData<&'a ResourceGroupToken>,
+    previous_group: Option<&'static ResourceStats>,
+    _token: PhantomData<(&'a ResourceGroupToken, *mut ())>,
 }
 
 impl Drop for ResourceTrackingGuard<'_> {
     fn drop(&mut self) {
-        // Grab our current total CPU usage for the thread, and calculate the delta.
-        let thread_cpu_usage_end = thread_cpu_time_nanos().unwrap_or(0);
-        let cpu_usage_delta = thread_cpu_usage_end.saturating_sub(self.thread_cpu_usage_start);
-
-        // Reset the current group to the one that existed before we entered.
-        CURRENT_GROUP.with(|current_group| {
-            let mut group_ptr = current_group.borrow_mut();
-
-            // Now track the delta in CPU usage, if available, before resetting the group.
-            if cpu_usage_delta != 0 {
-                // SAFETY: We only construct the pointer to `ResourceStats` from a leaked heap allocation, and we never
-                // deallocate it, so it's always non-null/aligned/valid-for-`T`, etc.
-                unsafe { group_ptr.as_ref().track_cpu_time(cpu_usage_delta) }
+        TRACKING.with(|tracking| {
+            let mut tracking = tracking.borrow_mut();
+            if tracking.group.map(ptr::from_ref) == self.previous_group.map(ptr::from_ref) {
+                tracking.flush_allocations();
+            } else {
+                tracking.switch_group(self.previous_group, thread_cpu_time_nanos());
             }
-
-            *group_ptr = self.previous_group_ptr;
         });
     }
 }
@@ -343,7 +392,8 @@ mod tests {
         task::{Context, Poll, Waker},
     };
 
-    use super::{ResourceGroupRegistry, ResourceGroupToken, Track};
+    use super::{ResourceGroupRegistry, ResourceGroupToken, ThreadTracking, Track};
+    use crate::resource_tracking::ResourceStatsSnapshot;
 
     /// Polls a future to completion on the current thread using a no-op `waker`.
     fn poll_to_completion<F: Future>(future: F) -> F::Output {
@@ -376,8 +426,6 @@ mod tests {
     // read it back and burn CPU are gated to avoid dead-code warnings elsewhere.
     #[cfg(target_os = "linux")]
     fn cpu_time_nanos_for(registry: &ResourceGroupRegistry, target: &str) -> u64 {
-        use crate::resource_tracking::ResourceStatsSnapshot;
-
         let mut cpu_time_nanos = 0;
         registry.visit_resource_groups(|name, stats| {
             if name == target {
@@ -511,6 +559,38 @@ mod tests {
         // ...yet polling the wrapper still re-enters the group captured at attach time.
         poll_to_completion(future);
         assert!(matched.get());
+    }
+
+    #[test]
+    fn group_switches_split_cpu_time_without_double_counting() {
+        let registry = ResourceGroupRegistry::global();
+        let outer = registry.register_resource_group("cpu-switch-outer").stats();
+        let inner = registry.register_resource_group("cpu-switch-inner").stats();
+        let mut tracking = ThreadTracking::new();
+
+        tracking.switch_group(Some(outer), Some(10));
+        tracking.switch_group(Some(inner), Some(20));
+        tracking.switch_group(Some(outer), Some(40));
+        tracking.switch_group(None, Some(45));
+
+        let empty = ResourceStatsSnapshot::empty();
+        assert_eq!(outer.snapshot_delta(&empty).cpu_time_nanos, 15);
+        assert_eq!(inner.snapshot_delta(&empty).cpu_time_nanos, 20);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nesting_the_same_group_does_not_publish_cpu_early() {
+        let group = ResourceGroupRegistry::global().register_resource_group("same-cpu-group");
+        let empty = ResourceStatsSnapshot::empty();
+        let outer = group.enter();
+        {
+            let _inner = group.enter();
+            burn_cpu();
+        }
+        assert_eq!(group.stats().snapshot_delta(&empty).cpu_time_nanos, 0);
+        drop(outer);
+        assert!(group.stats().snapshot_delta(&empty).cpu_time_nanos > 0);
     }
 
     #[cfg(target_os = "linux")]
