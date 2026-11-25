@@ -23,6 +23,7 @@ bytesize = { workspace = true }
 crossbeam-queue = { workspace = true }
 ddsketch = { workspace = true }
 futures = { workspace = true }
+hashbrown = { workspace = true }
 http = { workspace = true }
 indexmap = { workspace = true, features = ["std"] }
 loom = { workspace = true, optional = true }
