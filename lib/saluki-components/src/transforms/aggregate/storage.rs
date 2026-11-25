@@ -35,7 +35,7 @@ impl Kind {
         Self::Distribution,
     ];
 
-    const fn index(self) -> usize {
+    pub(super) const fn index(self) -> usize {
         match self {
             Self::Gauge => 0,
             Self::Counter => 1,
@@ -100,6 +100,17 @@ impl<T> Pages<T> {
         }
         self.pages[self.len / Self::ROWS].push(value);
         self.len += 1;
+    }
+
+    fn swap(&mut self, first: usize, second: usize) {
+        let (first_page, first_row) = (first / Self::ROWS, first % Self::ROWS);
+        let (second_page, second_row) = (second / Self::ROWS, second % Self::ROWS);
+        if first_page == second_page {
+            self.pages[first_page].swap(first_row, second_row);
+        } else {
+            let (before, after) = self.pages.split_at_mut(second_page);
+            mem::swap(&mut before[first_page][first_row], &mut after[0][second_row]);
+        }
     }
 
     fn swap_remove(&mut self, index: usize) -> T {
@@ -458,6 +469,17 @@ impl Rows {
         }
     }
 
+    fn swap(&mut self, kind: Kind, first: usize, second: usize) {
+        match kind {
+            Kind::Gauge => self.gauge.swap(first, second),
+            Kind::Counter => self.count.swap(first, second),
+            Kind::Rate => self.rate.swap(first, second),
+            Kind::Set => self.set.swap(first, second),
+            Kind::Histogram => self.histogram.swap(first, second),
+            Kind::Distribution => self.distribution.swap(first, second),
+        }
+    }
+
     fn swap_remove(&mut self, slot: Slot) -> Header {
         let i = slot.index();
         match slot.kind() {
@@ -777,6 +799,17 @@ impl Storage {
                 .expect("a moved row is indexed") = slot.0;
         }
         header
+    }
+
+    pub(super) fn swap(&mut self, first: Slot, second: Slot) {
+        let slots = [first, second];
+        let hashes = slots.map(|slot| self.hash_builder.hash_one(&self.header(slot).context));
+        let entries = self.index.get_disjoint_mut(hashes, |i, &id| id == slots[i].0);
+        let [Some(first_entry), Some(second_entry)] = entries else {
+            unreachable!("both live rows are indexed");
+        };
+        mem::swap(first_entry, second_entry);
+        self.rows.swap(first.kind(), first.index(), second.index());
     }
 
     pub(super) fn trim_empty_side_stores(&mut self) {
