@@ -1150,10 +1150,8 @@ fn build_io_buffer_pool(
         "dogstatsd buffer size add does not overflow",
         { "buffer_size": buffer_size }
     );
-    let adjusted_buffer_size = get_adjusted_buffer_size(buffer_size);
-    ElasticObjectPool::with_builder("dsd_packet_bufs", min_buffers, max_buffers, move || {
-        FixedSizeVec::with_capacity(adjusted_buffer_size)
-    })
+    let builder = FixedSizeVec::slab_builder(get_adjusted_buffer_size(buffer_size), max_buffers);
+    ElasticObjectPool::with_builder("dsd_packet_bufs", min_buffers, max_buffers, builder)
 }
 
 fn is_connectionless_listen_address(listen_addr: &ListenAddress) -> bool {
