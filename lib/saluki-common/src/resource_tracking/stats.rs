@@ -1,5 +1,62 @@
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 
+const BATCH_BYTE_LIMIT: usize = 64 * 1024;
+const BATCH_OBJECT_LIMIT: usize = 256;
+
+pub(super) struct AllocationCounts {
+    allocated_bytes: usize,
+    allocated_objects: usize,
+    deallocated_bytes: usize,
+    deallocated_objects: usize,
+}
+
+impl AllocationCounts {
+    pub(super) const EMPTY: Self = Self {
+        allocated_bytes: 0,
+        allocated_objects: 0,
+        deallocated_bytes: 0,
+        deallocated_objects: 0,
+    };
+
+    #[inline]
+    pub(super) fn allocation(size: usize) -> Self {
+        Self {
+            allocated_bytes: size,
+            allocated_objects: 1,
+            ..Self::EMPTY
+        }
+    }
+
+    #[inline]
+    pub(super) fn deallocation(size: usize) -> Self {
+        Self {
+            deallocated_bytes: size,
+            deallocated_objects: 1,
+            ..Self::EMPTY
+        }
+    }
+
+    #[inline]
+    pub(super) fn resize(old_size: usize, new_size: usize) -> Self {
+        Self {
+            allocated_bytes: new_size.saturating_sub(old_size),
+            deallocated_bytes: old_size.saturating_sub(new_size),
+            ..Self::EMPTY
+        }
+    }
+
+    #[inline]
+    pub(super) fn accumulate(&mut self, other: &Self) -> bool {
+        self.allocated_bytes += other.allocated_bytes;
+        self.allocated_objects += other.allocated_objects;
+        self.deallocated_bytes += other.deallocated_bytes;
+        self.deallocated_objects += other.deallocated_objects;
+
+        self.allocated_bytes + self.deallocated_bytes >= BATCH_BYTE_LIMIT
+            || self.allocated_objects + self.deallocated_objects >= BATCH_OBJECT_LIMIT
+    }
+}
+
 /// Statistics for an resource group.
 pub struct ResourceStats {
     allocated_bytes: AtomicUsize,
@@ -20,26 +77,29 @@ impl ResourceStats {
         }
     }
 
-    /// Returns `true` if the given group has allocated any memory at all.
+    /// Returns `true` if the group has published any allocated bytes.
     pub fn has_allocated(&self) -> bool {
         self.allocated_bytes.load(Relaxed) > 0
     }
 
     #[inline]
-    pub(super) fn track_allocation(&self, size: usize) {
-        self.allocated_bytes.fetch_add(size, Relaxed);
-        self.allocated_objects.fetch_add(1, Relaxed);
+    pub(super) fn publish_allocations(&self, counts: &AllocationCounts) {
+        for (counter, delta) in [
+            (&self.allocated_bytes, counts.allocated_bytes),
+            (&self.allocated_objects, counts.allocated_objects),
+            (&self.deallocated_bytes, counts.deallocated_bytes),
+            (&self.deallocated_objects, counts.deallocated_objects),
+        ] {
+            if delta != 0 {
+                counter.fetch_add(delta, Relaxed);
+            }
+        }
     }
 
-    #[inline]
-    pub(super) fn track_deallocation(&self, size: usize) {
-        self.deallocated_bytes.fetch_add(size, Relaxed);
-        self.deallocated_objects.fetch_add(1, Relaxed);
-    }
-
-    #[inline]
     pub(super) fn track_cpu_time(&self, nanos: u64) {
-        self.cpu_time_nanos.fetch_add(nanos, Relaxed);
+        if nanos != 0 {
+            self.cpu_time_nanos.fetch_add(nanos, Relaxed);
+        }
     }
 
     /// Captures a snapshot of the current statistics based on the delta from a previous snapshot.
@@ -50,13 +110,27 @@ impl ResourceStats {
     /// Callers should generally create their snapshot via [`ResourceStatsSnapshot::empty`] and then use this method
     /// to get their snapshot delta, utilize those delta values in whatever way is necessary, and then merge the
     /// snapshot delta into the primary snapshot via [`ResourceStatsSnapshot::merge`] to make it current.
+    ///
+    /// Active groups can have unpublished counts. Snapshots defer published frees that exceed published allocations
+    /// until the allocation counts catch up.
     pub fn snapshot_delta(&self, previous: &ResourceStatsSnapshot) -> ResourceStatsSnapshot {
+        let deallocated_bytes = self.deallocated_bytes.load(Relaxed);
+        let deallocated_objects = self.deallocated_objects.load(Relaxed);
+        let allocated_bytes = self.allocated_bytes.load(Relaxed);
+        let allocated_objects = self.allocated_objects.load(Relaxed);
         ResourceStatsSnapshot {
-            allocated_bytes: self.allocated_bytes.load(Relaxed) - previous.allocated_bytes,
-            allocated_objects: self.allocated_objects.load(Relaxed) - previous.allocated_objects,
-            deallocated_bytes: self.deallocated_bytes.load(Relaxed) - previous.deallocated_bytes,
-            deallocated_objects: self.deallocated_objects.load(Relaxed) - previous.deallocated_objects,
-            cpu_time_nanos: self.cpu_time_nanos.load(Relaxed) - previous.cpu_time_nanos,
+            allocated_bytes: allocated_bytes.saturating_sub(previous.allocated_bytes),
+            allocated_objects: allocated_objects.saturating_sub(previous.allocated_objects),
+            deallocated_bytes: deallocated_bytes
+                .min(allocated_bytes)
+                .saturating_sub(previous.deallocated_bytes),
+            deallocated_objects: deallocated_objects
+                .min(allocated_objects)
+                .saturating_sub(previous.deallocated_objects),
+            cpu_time_nanos: self
+                .cpu_time_nanos
+                .load(Relaxed)
+                .saturating_sub(previous.cpu_time_nanos),
         }
     }
 }
@@ -93,9 +167,7 @@ impl ResourceStatsSnapshot {
 
     /// Returns the number of live allocated bytes.
     ///
-    /// Saturates at zero rather than underflowing. The allocation and deallocation counters this is derived from are
-    /// read independently, so a deallocation landing between the two reads can momentarily make the difference
-    /// negative.
+    /// Saturates at zero because a delta can contain frees for allocations from an earlier snapshot.
     pub fn live_bytes(&self) -> usize {
         self.allocated_bytes.saturating_sub(self.deallocated_bytes)
     }
@@ -109,8 +181,7 @@ impl ResourceStatsSnapshot {
 
     /// Merges `other` into `self`.
     ///
-    /// This can be used to accumulate the total number of (de)allocated bytes and objects when handling the deltas
-    /// generated from `ResourceStats::consume`.
+    /// This accumulates the totals from successive calls to [`ResourceStats::snapshot_delta`].
     pub fn merge(&mut self, other: &Self) {
         self.allocated_bytes += other.allocated_bytes;
         self.allocated_objects += other.allocated_objects;
@@ -124,12 +195,8 @@ impl ResourceStatsSnapshot {
 #[cfg(target_os = "linux")]
 #[inline]
 pub(crate) fn thread_cpu_time_nanos() -> Option<u64> {
-    // NOTE: `CLOCK_THREAD_CPUTIME_ID` is not vDSO accelerated and degrades to a full syscall.
-    //
-    // Practically speaking, this ends up being roughly ~40-50x slower than a vDSO call at around 850ns or so. This is
-    // acceptable for our use case, because we're only tracking thread CPU time on task enter/exit, and only doing so on
-    // root task futures which are running for appreciable amounts of time so the rate at which we're calling this is fairly
-    // low.
+    // `CLOCK_THREAD_CPUTIME_ID` requires a syscall. Sample only at active group changes so that nested guards for
+    // the same group do not incur another pair of syscalls.
 
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     // SAFETY: We pass a valid reference to the `timespec` struct, and `CLOCK_THREAD_CPUTIME_ID` has been available
