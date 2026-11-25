@@ -595,9 +595,8 @@ impl ContextResolver {
                     }
                     None => {
                         // If the tagset is not cached, we need to create it.
-                        let tag_set = self.tags_resolver.create_tag_set(tags.clone()).unwrap_or_default();
-
-                        self.tags_resolver.insert_tag_set(tagset_key, tag_set.clone());
+                        let tag_set = self.tags_resolver.create_tag_set(tags).unwrap_or_default();
+                        self.tags_resolver.insert_tag_set(tagset_key, &tag_set);
 
                         tag_set
                     }
@@ -651,7 +650,6 @@ async fn drive_telemetry(interner: GenericMapInterner, telemetry: Telemetry, shu
 /// A builder for a tag resolver.
 pub struct TagsResolverBuilder {
     name: String,
-    caching_enabled: bool,
     cached_tagset_limit: Option<NonZeroUsize>,
     idle_tagset_expiration: Option<Duration>,
     allow_heap_allocations: Option<bool>,
@@ -670,8 +668,7 @@ impl TagsResolverBuilder {
 
         Ok(Self {
             name,
-            caching_enabled: true,
-            cached_tagset_limit: None,
+            cached_tagset_limit: Some(DEFAULT_CONTEXT_RESOLVER_CACHED_CONTEXTS_LIMIT),
             idle_tagset_expiration: None,
             allow_heap_allocations: None,
             origin_tags_resolver: None,
@@ -705,8 +702,7 @@ impl TagsResolverBuilder {
     ///
     /// Defaults to caching enabled.
     pub fn without_caching(mut self) -> Self {
-        self.caching_enabled = false;
-        self.idle_tagset_expiration = None;
+        self.cached_tagset_limit = None;
         self
     }
 
@@ -725,13 +721,8 @@ impl TagsResolverBuilder {
     ///
     /// Defaults to 500,000.
     pub fn with_cached_tagsets_limit(mut self, limit: usize) -> Self {
-        match NonZeroUsize::new(limit) {
-            Some(limit) => {
-                self.cached_tagset_limit = Some(limit);
-                self
-            }
-            None => self.without_caching(),
-        }
+        self.cached_tagset_limit = self.cached_tagset_limit.and(NonZeroUsize::new(limit));
+        self
     }
 
     /// Sets the time before tag sets are considered "idle" and eligible for expiration.
@@ -741,9 +732,13 @@ impl TagsResolverBuilder {
     /// prior to their natural expiration time if the cache is full and evictions are required to make room for a new
     /// context.
     ///
+    /// This has no effect if caching is disabled.
+    ///
     /// Defaults to no expiration.
     pub fn with_idle_tagsets_expiration(mut self, time_to_idle: Duration) -> Self {
-        self.idle_tagset_expiration = Some(time_to_idle);
+        if self.cached_tagset_limit.is_some() {
+            self.idle_tagset_expiration = Some(time_to_idle);
+        }
         self
     }
 
@@ -792,29 +787,25 @@ impl TagsResolverBuilder {
 
     /// Builds a [`TagsResolver`] from the current configuration.
     pub fn build(self) -> TagsResolver {
-        let cached_tagsets_limit = self
-            .cached_tagset_limit
-            .unwrap_or(DEFAULT_CONTEXT_RESOLVER_CACHED_CONTEXTS_LIMIT);
-
         let allow_heap_allocations = self.allow_heap_allocations.unwrap_or(true);
 
-        let telemetry = Telemetry::new(self.name.clone());
+        let tagset_cache = self.cached_tagset_limit.map(|limit| {
+            CacheBuilder::from_identifier(format!("{}/tagsets", self.name))
+                .expect("cache identifier cannot possibly be empty")
+                .with_capacity(limit)
+                .with_time_to_idle(self.idle_tagset_expiration)
+                .with_hasher::<NoopU64BuildHasher>()
+                .with_telemetry(self.telemetry_enabled)
+                .build()
+        });
+        let telemetry = Telemetry::new(self.name);
         telemetry
             .interner_capacity_bytes()
             .set(self.interner.capacity_bytes() as f64);
 
-        let tagset_cache = CacheBuilder::from_identifier(format!("{}/tagsets", self.name))
-            .expect("cache identifier cannot possibly be empty")
-            .with_capacity(cached_tagsets_limit)
-            .with_time_to_idle(self.idle_tagset_expiration)
-            .with_hasher::<NoopU64BuildHasher>()
-            .with_telemetry(self.telemetry_enabled)
-            .build();
-
         TagsResolver {
             telemetry,
             interner: self.interner,
-            caching_enabled: self.caching_enabled,
             tagset_cache,
             origin_tags_resolver: self.origin_tags_resolver,
             allow_heap_allocations,
@@ -846,8 +837,7 @@ impl TagsResolverBuilder {
 pub struct TagsResolver {
     telemetry: Telemetry,
     interner: GenericMapInterner,
-    caching_enabled: bool,
-    tagset_cache: TagSetCache,
+    tagset_cache: Option<TagSetCache>,
     origin_tags_resolver: Option<Arc<dyn OriginTagsResolver>>,
     allow_heap_allocations: bool,
 }
@@ -878,10 +868,7 @@ impl TagsResolver {
 
     /// Creates a new tag set from the given tags.
     ///
-    /// This will intern the tags, and then return a shared tag set. If the interner is full, and heap allocations are
-    /// not allowed, then this will return `None`.
-    ///
-    /// If heap allocations are allowed, then this will return a shared tag set, and the tag set will be cached.
+    /// Returns `None` if a tag cannot be interned and heap allocations are not allowed.
     pub fn create_tag_set<I, T>(&mut self, tags: I) -> Option<SharedTagSet>
     where
         I: IntoIterator<Item = T>,
@@ -909,11 +896,13 @@ impl TagsResolver {
     }
 
     fn get_tag_set(&self, key: TagSetKey) -> Option<SharedTagSet> {
-        self.tagset_cache.get(&key)
+        self.tagset_cache.as_ref()?.get(&key)
     }
 
-    fn insert_tag_set(&self, key: TagSetKey, tag_set: SharedTagSet) {
-        self.tagset_cache.insert(key, tag_set);
+    fn insert_tag_set(&self, key: TagSetKey, tag_set: &SharedTagSet) {
+        if let Some(cache) = &self.tagset_cache {
+            cache.insert(key, tag_set.clone());
+        }
     }
 }
 
@@ -922,7 +911,6 @@ impl Clone for TagsResolver {
         Self {
             telemetry: self.telemetry.clone(),
             interner: self.interner.clone(),
-            caching_enabled: self.caching_enabled,
             tagset_cache: self.tagset_cache.clone(),
             origin_tags_resolver: self.origin_tags_resolver.clone(),
             allow_heap_allocations: self.allow_heap_allocations,
@@ -1376,6 +1364,31 @@ mod tests {
         // they're two distinct contexts in terms of not being cached:
         assert_eq!(context1, context2);
         assert!(!context1.ptr_eq(&context2));
+    }
+
+    #[test]
+    fn zero_tagset_limit_allocates_no_cache_and_preserves_tags() {
+        let tags_resolver = TagsResolverBuilder::for_tests().with_cached_tagsets_limit(0).build();
+        assert!(tags_resolver.tagset_cache.is_none());
+        let mut resolver = ContextResolverBuilder::for_tests()
+            .with_tags_resolver(Some(tags_resolver))
+            .build();
+
+        let tags = ["env:prod", "service:more-than-23-bytes-long"];
+        for name in ["first.metric", "second.metric"] {
+            let context = resolver.resolve(name, tags, None).unwrap();
+            assert_eq!(context.tags().len(), tags.len());
+            assert!(tags.iter().all(|tag| context.tags().has_tag(tag)));
+        }
+    }
+
+    #[test]
+    fn idle_expiration_does_not_enable_tagset_caching() {
+        let builder = || TagsResolverBuilder::new("disabled", GenericMapInterner::new(NonZeroUsize::MIN)).unwrap();
+        for disabled in [builder().with_cached_tagsets_limit(0), builder().without_caching()] {
+            let resolver = disabled.with_idle_tagsets_expiration(Duration::from_secs(20)).build();
+            assert!(resolver.tagset_cache.is_none());
+        }
     }
 
     #[test]
