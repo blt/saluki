@@ -1684,7 +1684,7 @@ pub(super) fn metric_has_emittable_values(metric: &Metric) -> bool {
 
 fn write_metric_to_v3(
     writer: &mut V3Writer, metric: &Metric, additional_tags: &SharedTagSet,
-    tags_deduplicator: &mut ReusableDeduplicator<Tag>,
+    tags_deduplicator: &mut ReusableDeduplicator<str>,
 ) {
     if !metric_has_emittable_values(metric) {
         debug!(metric_name = %metric.context().name(), "Dropping metric with no emittable values.");
@@ -1701,17 +1701,9 @@ fn write_metric_to_v3(
 
     let mut builder = writer.write(metric_type, metric.context().name());
 
-    // Tags - chain instrumented + additional + origin tags
-    let chained_tags = metric
-        .context()
-        .tags()
-        .into_iter()
-        .chain(additional_tags)
-        .chain(metric.context().origin_tags());
     let all_tags = tags_deduplicator
-        .deduplicated(chained_tags)
-        .filter(|t| is_sketch || !is_v3_series_resource_tag(t) && !is_v3_series_device_tag(t))
-        .map(|t| t.as_str());
+        .deduplicated(metric_tag_strings(metric, additional_tags))
+        .filter(|tag| is_sketch || !tag.starts_with("dd.internal.resource:") && !tag.starts_with("device:"));
     builder.set_tags(all_tags);
 
     // Resources - extract host and, for series, promoted resource tags.
@@ -1725,13 +1717,14 @@ fn write_metric_to_v3(
             .context()
             .origin_tags()
             .into_iter()
-            .chain(metric.context().tags())
-            .chain(additional_tags);
+            .map(Tag::as_str)
+            .chain(metric.context().tags().strings())
+            .chain(additional_tags.into_iter().map(Tag::as_str));
         for tag in tags_deduplicator.deduplicated(chained_tags) {
-            if is_v3_series_device_tag(tag) {
-                device_resource = tag.value().filter(|device| !device.is_empty());
-            } else if is_v3_series_resource_tag(tag) {
-                if let Some((rtype, rname)) = tag.value().and_then(|value| value.split_once(':')) {
+            if let Some(device) = tag.strip_prefix("device:") {
+                device_resource = Some(device).filter(|device| !device.is_empty());
+            } else if let Some(resource) = tag.strip_prefix("dd.internal.resource:") {
+                if let Some((rtype, rname)) = resource.split_once(':') {
                     if !rtype.is_empty() && !rname.is_empty() {
                         resources.push((rtype, rname));
                     }
@@ -1855,12 +1848,13 @@ fn emittable_scalar_point(point: f64) -> bool {
     point.is_finite()
 }
 
-fn is_v3_series_device_tag(tag: &Tag) -> bool {
-    tag.name() == "device" && tag.value().is_some()
-}
-
-fn is_v3_series_resource_tag(tag: &Tag) -> bool {
-    tag.name() == "dd.internal.resource" && tag.value().is_some()
+fn metric_tag_strings<'a>(metric: &'a Metric, additional_tags: &'a SharedTagSet) -> impl Iterator<Item = &'a str> {
+    metric
+        .context()
+        .tags()
+        .strings()
+        .chain(additional_tags.into_iter().map(Tag::as_str))
+        .chain(metric.context().origin_tags().into_iter().map(Tag::as_str))
 }
 
 /// Creates a V3 HTTP request from encoded payload data.
