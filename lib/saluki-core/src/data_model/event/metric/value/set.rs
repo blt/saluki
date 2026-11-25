@@ -1,4 +1,4 @@
-use std::{collections::HashSet, fmt, num::NonZeroU64};
+use std::{collections::HashSet, fmt, num::NonZeroU64, sync::Arc};
 
 use stringtheory::MetaString;
 
@@ -71,7 +71,7 @@ impl<'a> FromIterator<&'a str> for SetMembers {
     {
         let mut members = Self::Empty;
         for value in iter {
-            members.insert(MetaString::from(value));
+            members.insert(set_member(value));
         }
         members
     }
@@ -140,22 +140,26 @@ impl SetPoints {
     }
 }
 
+fn set_member(value: &str) -> MetaString {
+    // Closed exact Sets can fan out to multiple consumers; a clone must not copy the member payloads.
+    MetaString::try_inline(value).unwrap_or_else(|| MetaString::from(Arc::<str>::from(value)))
+}
+
 impl From<String> for SetPoints {
     fn from(value: String) -> Self {
-        let value = MetaString::try_inline(&value).unwrap_or_else(|| MetaString::from(value));
-        Self(TimestampedValue::from(SetMembers::One(value)).into())
+        Self::from(value.as_str())
     }
 }
 
 impl<'a> From<&'a str> for SetPoints {
     fn from(value: &'a str) -> Self {
-        Self(TimestampedValue::from(SetMembers::One(MetaString::from(value))).into())
+        Self(TimestampedValue::from(SetMembers::One(set_member(value))).into())
     }
 }
 
 impl<'a> From<(u64, &'a str)> for SetPoints {
     fn from((ts, value): (u64, &'a str)) -> Self {
-        Self(TimestampedValue::from((ts, SetMembers::One(MetaString::from(value)))).into())
+        Self(TimestampedValue::from((ts, SetMembers::One(set_member(value)))).into())
     }
 }
 
@@ -176,7 +180,7 @@ impl<'a, const N: usize> From<[(u64, &'a str); N]> for SetPoints {
         Self(
             values
                 .iter()
-                .map(|(ts, value)| TimestampedValue::from((*ts, SetMembers::One(MetaString::from(*value)))))
+                .map(|(ts, value)| TimestampedValue::from((*ts, SetMembers::One(set_member(value)))))
                 .into(),
         )
     }
@@ -254,6 +258,27 @@ mod tests {
         assert_eq!(points.len(), 1);
         assert_eq!((&points).into_iter().collect::<Vec<_>>(), [(None, 1.0)]);
         assert_eq!(points.clone().into_iter().collect::<Vec<_>>(), [(None, 1.0)]);
+    }
+
+    #[test]
+    fn cloned_exact_sets_share_long_member_buffers() {
+        let first = "x".repeat(8174);
+        let second = "y".repeat(8174);
+        let mut points = SetPoints::from([first.as_str(), second.as_str()]);
+        let cloned = points.clone();
+        assert_eq!(points, cloned);
+        for member in points.inner().values[0].value.iter() {
+            let copied = cloned.inner().values[0]
+                .value
+                .iter()
+                .find(|other| *other == member)
+                .unwrap();
+            assert_eq!(member.as_ptr(), copied.as_ptr());
+        }
+        points.merge(SetPoints::from(first));
+        assert_eq!(points, cloned);
+        points.merge(SetPoints::from("distinct"));
+        assert_ne!(points, cloned);
     }
 
     #[test]
