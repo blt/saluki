@@ -43,7 +43,7 @@ use saluki_core::{
             },
             EventType,
         },
-        tags::Tag,
+        tags::{BorrowedTag, Tag},
     },
     observability::ComponentMetricsExt,
     topology::OutputDefinition,
@@ -565,10 +565,10 @@ impl Transform for TagFilterlist {
 
 #[inline]
 fn filter_tag(
-    tag: &Tag, key_filter: Option<&CompiledKeyFilter>, value_filter: Option<&CompiledValuePrefixFilter>,
+    tag: &str, key_filter: Option<&CompiledKeyFilter>, value_filter: Option<&CompiledValuePrefixFilter>,
     key_buf: &mut TagBuf, replacements: &mut Vec<Tag>,
 ) -> bool {
-    let key = tag_key(tag.as_str(), key_buf);
+    let key = tag_key(tag, key_buf);
 
     if let Some(key_filter) = key_filter {
         if key_filter.is_exclude == key_filter.tag_names.contains(key.key) {
@@ -584,7 +584,7 @@ fn filter_tag(
         return true;
     };
 
-    let tag = tag.as_borrowed();
+    let tag = BorrowedTag::from(tag);
     let Some(value) = tag.value() else {
         return true;
     };
@@ -618,7 +618,7 @@ fn filter_tag(
 pub fn filter_metric_tags(
     metric: &mut Metric, state: &mut TagSetMutViewState, filters: &CompiledFilters,
 ) -> FilterMetricTagsOutcome {
-    let metric_name = metric.context().name().clone();
+    let metric_name = metric.context().name();
     let key_filter = filters.key_filter(metric_name.as_ref());
     let value_filter = filters.value_prefix_filters.get(metric_name.as_ref());
     if key_filter.is_none() && value_filter.is_none() {
@@ -629,10 +629,18 @@ pub fn filter_metric_tags(
     let mut tag_replacements = Vec::new();
     let mut origin_tag_replacements = Vec::new();
     let mut tag_set_view = metric.context_mut().tags_mut_view(state);
-    tag_set_view.retain_tags(|tag| filter_tag(tag, key_filter, value_filter, &mut key_buf, &mut tag_replacements));
+    tag_set_view.retain_tags(|tag| {
+        filter_tag(
+            tag.as_str(),
+            key_filter,
+            value_filter,
+            &mut key_buf,
+            &mut tag_replacements,
+        )
+    });
     tag_set_view.retain_origin_tags(|tag| {
         filter_tag(
-            tag,
+            tag.as_str(),
             key_filter,
             value_filter,
             &mut key_buf,
