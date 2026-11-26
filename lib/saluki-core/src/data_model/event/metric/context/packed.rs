@@ -130,6 +130,13 @@ impl Header {
         &self.domain.as_ref().expect("symbol has a resolver domain").symbols
     }
 
+    fn symbol_text(&self, id: u32) -> (&str, Option<(usize, u32)>) {
+        let table = self.symbols();
+        // SAFETY: The context owns this symbol reference.
+        let text = unsafe { table.get_unchecked(id) };
+        (text, Some((std::ptr::from_ref(table).addr(), id)))
+    }
+
     fn prefix_size(&self) -> usize {
         usize::from(self.has(ORIGIN)) * size_of::<TagSet>()
             + usize::from(self.has(LEASE)) * size_of::<Arc<StrictLease>>()
@@ -331,6 +338,15 @@ impl Packed {
 
     pub(super) fn track_rewrite(&self) -> bool {
         self.header().has(TRACKED) && self.strong_count() == 1
+    }
+
+    pub(super) fn name_with_symbol_id(&self) -> (&str, Option<(usize, u32)>) {
+        let header = self.header();
+        if header.has(NAME_ID) {
+            header.symbol_text(header.name)
+        } else {
+            (self.name(), None)
+        }
     }
 
     pub(super) fn name(&self) -> &str {
@@ -585,12 +601,31 @@ impl<'a> Iterator for RawTags<'a> {
         // SAFETY: Construction copies each tag from a valid UTF-8 string.
         Some(RawTag::Inline(unsafe { str::from_utf8_unchecked(text) }))
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.count - self.index;
+        (remaining, Some(remaining))
+    }
 }
+
+impl ExactSizeIterator for RawTags<'_> {}
 
 #[derive(Clone)]
 pub(super) struct TagIter<'a> {
     header: &'a Header,
     raw: RawTags<'a>,
+}
+
+impl<'a> TagIter<'a> {
+    pub(super) fn strings_with_symbol_ids(
+        self,
+    ) -> impl ExactSizeIterator<Item = (&'a str, Option<(usize, u32)>)> + Clone {
+        let header = self.header;
+        self.raw.map(move |tag| match tag {
+            RawTag::Inline(text) => (text, None),
+            RawTag::Id(id) => header.symbol_text(id),
+        })
+    }
 }
 
 impl<'a> Iterator for TagIter<'a> {
@@ -605,8 +640,7 @@ impl<'a> Iterator for TagIter<'a> {
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = self.raw.count - self.raw.index;
-        (remaining, Some(remaining))
+        self.raw.size_hint()
     }
 }
 
