@@ -6,7 +6,6 @@ use saluki_core::data_model::event::metric::{
     context::Context, Histogram, HistogramPoints, MetricMetadata, MetricOrigin, MetricValues, ScalarPoints, SetBucket,
     SetPoints, SketchPoints,
 };
-use stringtheory::MetaString;
 
 use super::{telemetry::OriginContextId, AggregateMetricType as Kind};
 
@@ -243,20 +242,17 @@ impl MetadataStore {
         }
     }
 
-    fn fill_unit(&mut self, id: &mut u32, unit: MetaString) {
-        if unit.is_empty() {
-            return;
-        }
+    fn fill_unit(&mut self, id: &mut u32, incoming: &MetricMetadata) {
+        let Some(unit) = incoming.unit() else { return };
         if *id & OWNED_METADATA != 0 {
-            let stored = self.0.get_mut(*id & !OWNED_METADATA);
-            if stored.unit.is_empty() {
-                stored.unit = unit;
-            }
+            self.0.get_mut(*id & !OWNED_METADATA).fill_unit(incoming);
         } else if *id & 4 == 0 {
             if unit == "millisecond" {
                 *id |= 4;
             } else {
-                *id = self.insert(static_metadata(*id).with_unit(unit));
+                let mut metadata = static_metadata(*id);
+                metadata.fill_unit(incoming);
+                *id = self.insert(metadata);
             }
         }
     }
@@ -265,10 +261,7 @@ impl MetadataStore {
         if id & OWNED_METADATA == 0 {
             static_metadata(id)
         } else {
-            match self.0.slots.get((id & !OWNED_METADATA) as usize) {
-                SideSlot::Live(metadata) => metadata.clone(),
-                SideSlot::Free(_) => unreachable!("a retained row owns its metadata"),
-            }
+            self.0.get(id & !OWNED_METADATA).clone()
         }
     }
 
@@ -312,12 +305,12 @@ fn static_metadata(id: u32) -> MetricMetadata {
             product_detail: id >> 3,
         }),
     };
-    let unit = if id & 4 == 0 {
-        MetaString::empty()
+    let metadata = MetricMetadata::default().with_origin(origin);
+    if id & 4 == 0 {
+        metadata
     } else {
-        MetaString::from_static("millisecond")
-    };
-    MetricMetadata { origin, unit }
+        metadata.with_unit("millisecond")
+    }
 }
 
 pub(super) struct Header {
@@ -599,7 +592,6 @@ impl Storage {
             .map(Slot)
     }
 
-    #[allow(dead_code)]
     pub(super) fn growth_bytes(
         &self, slot: Option<Slot>, values: &MetricValues, metadata: &MetricMetadata, last_seen: u64,
     ) -> usize {
@@ -786,9 +778,7 @@ impl Storage {
         let kind = Kind::from(&values);
         let epoch = self.epoch.expect("a live row has an epoch");
         let header = self.rows.header_mut(slot);
-        if !metadata.unit.is_empty() {
-            self.metadata.fill_unit(&mut header.metadata_id, metadata.unit);
-        }
+        self.metadata.fill_unit(&mut header.metadata_id, &metadata);
         if slot.kind() != kind {
             self.discard_values(slot);
             let mut header = self.unlink(slot);
